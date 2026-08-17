@@ -8,6 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()  # Load environment variables from .env file
+
 try:
     from .models import (
         Architecture,

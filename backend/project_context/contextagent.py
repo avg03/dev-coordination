@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from dotenv import load_dotenv
 import argparse
 import json
 import os
@@ -8,11 +8,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
 
+from google.genai import types
 from google.adk.agents import Agent
-from google.adk.models import GoogleGenAIModels
+from google.adk.models import Gemini
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 
+load_dotenv()  # Load environment variables from .env file
 try:
     from .models import (
         AgentAnalysisOutput,
@@ -30,7 +32,7 @@ except ImportError:
         RawContext,
     )
 
-DEFAULT_MODEL = os.getenv("CONTEXT_AGENT_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL = os.getenv("CONTEXT_AGENT_MODEL", "gemini-3.6-flash")
 
 
 class ProjectContextAgent:
@@ -49,14 +51,15 @@ class ProjectContextAgent:
             agent=self.agent,
             app_name=self.app_name,
             session_service=self.session_service,
+            auto_create_session=True,
         )
 
     def _build_agent(self) -> Agent:
         return Agent(
             name="context_agent",
-            model=GoogleGenAIModels(self.model),
+            model=Gemini(model=self.model),
             instruction=CONTEXT_AGENT_INSTRUCTION,
-            structured_output=AgentAnalysisOutput,
+            output_schema=AgentAnalysisOutput,
         )
 
     def analyze(self, description: str, source_type: str = "text") -> ProjectContextOutput:
@@ -64,17 +67,15 @@ class ProjectContextAgent:
             raise ValueError("Project description cannot be empty.")
 
         session_id = uuid.uuid4().hex
-        self.session_service.create_session(
-            app_name=self.app_name,
+        new_message = types.Content(role="user", parts=[types.Part(text=description)])
+        events = list(
+            self.runner.run(
             user_id="user",
             session_id=session_id,
+            new_message=new_message,
         )
-        result = self.runner.run(
-            user_id="user",
-            session_id=session_id,
-            query=description,
         )
-        analysis = self._extract_analysis(result)
+        analysis = self._extract_analysis(events)
         now = datetime.now(timezone.utc).isoformat()
         return ProjectContextOutput(
             **analysis.model_dump(),
@@ -89,21 +90,22 @@ class ProjectContextAgent:
             ),
         )
 
-    def _extract_analysis(self, result) -> AgentAnalysisOutput:
-        response = getattr(result, "response", None)
-        if response is None:
-            raise RuntimeError("Agent returned no response.")
-
+    def _extract_analysis(self, events: list[object]) -> AgentAnalysisOutput:
+        if not events:
+            raise RuntimeError("Agent returned no events.")
         candidates: list[object] = []
-        parsed = getattr(response, "parsed", None)
-        if parsed is not None:
-            candidates.append(parsed)
-        content = getattr(response, "content", None)
-        if isinstance(content, dict):
-            candidates.append(content)
-        text = getattr(response, "text", None)
-        if text:
-            candidates.append(text)
+        for event in reversed(events):
+            if getattr(event, "author", "") == "user":
+                continue
+            output = getattr(event, "output", None)
+            if output is not None:
+                candidates.append(output)
+            content = getattr(event, "content", None)
+            parts = getattr(content, "parts", None) if content is not None else None
+            if parts:
+                text = "".join(part.text or "" for part in parts if getattr(part, "text", None))
+                if text.strip():
+                    candidates.append(text)
 
         for candidate in candidates:
             if isinstance(candidate, AgentAnalysisOutput):
