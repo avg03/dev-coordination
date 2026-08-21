@@ -3,16 +3,22 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import APIRouter, Header, HTTPException, Request
 
-from .config import settings
 from .extractors import extract_metadata
 from .publisher import get_publisher
 from .security import verify_signature
 
 logger = logging.getLogger("github.webhook")
+
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(dotenv_path=ENV_FILE)
+WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
 
 router = APIRouter(prefix="/github", tags=["github"])
 
@@ -26,9 +32,9 @@ async def github_webhook(
 ) -> dict:
     body = await request.body()
 
-    if not settings.webhook_secret:
+    if not WEBHOOK_SECRET:
         raise HTTPException(status_code=500, detail="GITHUB_WEBHOOK_SECRET is not configured")
-    if not verify_signature(settings.webhook_secret, body, x_hub_signature_256):
+    if not verify_signature(WEBHOOK_SECRET, body, x_hub_signature_256):
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     event = (x_github_event or "").strip()
