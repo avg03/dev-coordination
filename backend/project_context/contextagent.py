@@ -1,20 +1,21 @@
 from __future__ import annotations
-from dotenv import load_dotenv
+
 import argparse
+import asyncio
 import json
 import os
 import uuid
+from contextlib import aclosing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
 
-from google.genai import types
 from google.adk.agents import Agent
-from google.adk.models import Gemini
+from google.adk.events import Event
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from google.genai import types
 
-load_dotenv()  # Load environment variables from .env file
 try:
     from .models import (
         AgentAnalysisOutput,
@@ -32,7 +33,7 @@ except ImportError:
         RawContext,
     )
 
-DEFAULT_MODEL = os.getenv("CONTEXT_AGENT_MODEL", "gemini-3.6-flash")
+DEFAULT_MODEL = os.getenv("CONTEXT_AGENT_MODEL", "gemini-3.5-flash")
 
 
 class ProjectContextAgent:
@@ -48,16 +49,15 @@ class ProjectContextAgent:
         self.session_service = InMemorySessionService()
         self.agent = self._build_agent()
         self.runner = Runner(
-            agent=self.agent,
             app_name=self.app_name,
+            agent=self.agent,
             session_service=self.session_service,
-            auto_create_session=True,
         )
 
     def _build_agent(self) -> Agent:
         return Agent(
             name="context_agent",
-            model=Gemini(model=self.model),
+            model=self.model,
             instruction=CONTEXT_AGENT_INSTRUCTION,
             output_schema=AgentAnalysisOutput,
         )
@@ -66,15 +66,7 @@ class ProjectContextAgent:
         if not description or not description.strip():
             raise ValueError("Project description cannot be empty.")
 
-        session_id = uuid.uuid4().hex
-        new_message = types.Content(role="user", parts=[types.Part(text=description)])
-        events = list(
-            self.runner.run(
-            user_id="user",
-            session_id=session_id,
-            new_message=new_message,
-        )
-        )
+        events = asyncio.run(self._run_agent(description))
         analysis = self._extract_analysis(events)
         now = datetime.now(timezone.utc).isoformat()
         return ProjectContextOutput(
@@ -90,46 +82,57 @@ class ProjectContextAgent:
             ),
         )
 
-    def _extract_analysis(self, events: list[object]) -> AgentAnalysisOutput:
-        if not events:
-            raise RuntimeError("Agent returned no events.")
-        candidates: list[object] = []
+    async def _run_agent(self, description: str) -> list[Event]:
+        user_id = "user"
+        session = await self.session_service.create_session(
+            app_name=self.app_name,
+            user_id=user_id,
+            session_id=uuid.uuid4().hex,
+        )
+        user_message = types.UserContent(parts=[types.Part(text=description)])
+        events = []
+        async with aclosing(
+            self.runner.run_async(
+                user_id=user_id,
+                session_id=session.id,
+                new_message=user_message,
+            )
+        ) as stream:
+            async for event in stream:
+                events.append(event)
+        return events
+
+    def _extract_analysis(self, events: list[Event]) -> AgentAnalysisOutput:
         for event in reversed(events):
-            if getattr(event, "author", "") == "user":
+            if not event.is_final_response():
                 continue
-            output = getattr(event, "output", None)
-            if output is not None:
-                candidates.append(output)
-            content = getattr(event, "content", None)
-            parts = getattr(content, "parts", None) if content is not None else None
-            if parts:
-                text = "".join(part.text or "" for part in parts if getattr(part, "text", None))
-                if text.strip():
-                    candidates.append(text)
-
-        for candidate in candidates:
-            if isinstance(candidate, AgentAnalysisOutput):
-                return candidate
-            try:
-                return AgentAnalysisOutput.model_validate(self._coerce(candidate))
-            except (ValueError, TypeError, json.JSONDecodeError):
-                continue
-
+            text = self._event_text(event)
+            if text:
+                try:
+                    return AgentAnalysisOutput.model_validate(self._coerce(text))
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    continue
         raise RuntimeError("Could not extract structured output from the agent response.")
 
     @staticmethod
-    def _coerce(value: object) -> object:
-        if isinstance(value, str):
-            text = value.strip()
-            if text.startswith("```"):
-                lines = text.splitlines()
-                if lines and lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                text = "\n".join(lines)
-            return json.loads(text)
-        return value
+    def _event_text(event: Event) -> str:
+        content = event.content
+        if content is None:
+            return ""
+        parts = getattr(content, "parts", None) or []
+        return "".join(part.text for part in parts if part.text and not part.thought)
+
+    @staticmethod
+    def _coerce(value: str) -> object:
+        text = value.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines)
+        return json.loads(text)
 
     def save(self, output: ProjectContextOutput, name: Optional[str] = None) -> Path:
         filename = name or f"project_context_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"

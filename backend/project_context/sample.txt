@@ -1,0 +1,66 @@
+Project: CampusCart
+
+CampusCart is a college campus food-ordering platform that allows students to browse nearby food vendors, place orders, make payments, and track deliveries.
+
+The current goal is to improve the checkout and payment system. We are migrating from the existing Razorpay-based payment flow to a new payment abstraction layer so that multiple payment providers can be supported in the future.
+
+The work is being done primarily by the backend team, but the mobile team depends on the existing payment APIs. The QA team is responsible for testing checkout, payment success/failure, refunds, and order creation. The product manager is responsible for the checkout requirements and user experience.
+
+Current planned work:
+1. Create a payment abstraction layer in the backend.
+2. Move the existing Razorpay integration behind the abstraction layer.
+3. Modify the payment API response format.
+4. Update the mobile application's checkout flow.
+5. Update the QA test suite for payment success, failure, retry, and refund scenarios.
+6. Update payment-related documentation.
+7. Eventually support additional payment providers without changing the mobile application's checkout logic.
+
+Important architecture:
+- The mobile application is built using React Native.
+- The backend is built using Python/FastAPI.
+- PostgreSQL stores users, orders, payments, and transaction records.
+- Redis is used for temporary payment/session state.
+- The backend exposes REST APIs consumed by the mobile application.
+- The Payment Service communicates with Razorpay.
+- The Order Service creates an order after successful payment.
+- The Notification Service sends order confirmation notifications.
+- The mobile checkout flow depends on the Payment API response.
+- The QA team maintains automated integration tests for checkout and payment workflows.
+
+Important dependencies:
+- Mobile Checkout depends on the Payment API.
+- Payment Service depends on Razorpay.
+- Order Service depends on successful payment confirmation.
+- Notification Service depends on Order Service.
+- QA payment tests depend on the Payment API and payment state transitions.
+
+Team responsibilities:
+- Backend Team: Payment Service, Order Service, REST APIs.
+- Mobile Team: React Native application and checkout flow.
+- QA Team: checkout/payment testing and regression testing.
+- Product Team: checkout requirements and user-facing behavior.
+- DevOps Team: deployment, environment configuration, monitoring.
+- Finance/Ops Team: refunds and transaction reconciliation.
+
+Important project constraints:
+- Existing users must continue to be able to make payments during the migration.
+- The new abstraction layer must not expose payment-provider-specific details to the mobile application.
+- Payment failures must not result in duplicate orders.
+- Refund functionality must continue working.
+- Changes to payment APIs require coordination with the mobile team.
+- Production payment configuration changes require DevOps approval.
+
+Important decisions:
+- Keep the mobile application independent of the payment provider.
+- Use the backend payment abstraction layer as the only interface between the application and payment providers.
+- Preserve existing payment and order data in PostgreSQL.
+- Do not migrate historical transactions as part of this project.
+
+Success criteria:
+- Existing checkout flow continues working.
+- Razorpay integration works through the new abstraction layer.
+- Mobile checkout no longer depends directly on Razorpay-specific fields.
+- Payment failures and retries are handled correctly.
+- Duplicate orders are prevented.
+- Refund workflows continue working.
+- Architecture allows another payment provider to be added later.

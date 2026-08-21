@@ -1,4 +1,4 @@
-google-adk
+google-adk==2.5.0
 google-genai
 fastapi
 uvicorn[standard]
