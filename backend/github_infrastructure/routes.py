@@ -16,7 +16,7 @@ from .security import verify_signature
 
 logger = logging.getLogger("github.webhook")
 
-ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+ENV_FILE = Path("backend/.env")
 load_dotenv(dotenv_path=ENV_FILE)
 WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
 
@@ -31,6 +31,7 @@ async def github_webhook(
     x_github_delivery: Optional[str] = Header(default=None),
 ) -> dict:
     body = await request.body()
+    
 
     if not WEBHOOK_SECRET:
         raise HTTPException(status_code=500, detail="GITHUB_WEBHOOK_SECRET is not configured")
