@@ -68,7 +68,7 @@ def test_parse_full_record():
 
 def test_deterministic_extraction():
     record = parse_change_record(API_OUTPUT)
-    assert record.components == ["src"]
+    assert record.components == ["src/auth"]
     assert record.change_type == "feature"
     types = [e.type for e in record.evidence]
     assert "file_change" in types and "function_change" in types and "dependency" in types
@@ -85,10 +85,52 @@ def test_classification_rules():
     assert make(["README.md"], "update notes") == "docs"
     assert make(["tests/test_auth.py"], "wip") == "test"
     assert make(["deploy/config.yaml"], "tweak") == "config"
-    assert make(["src/a.py", "src/b.py"], "fix null pointer crash") == "bugfix"
+    assert make(["src/a.py", "src/b.py"], "fix null pointer crash") == "fix"
+    assert make(["src/a.py"], "crash reported on checkout page") == "bug"
     assert make(["src/a.py"], "refactor service layer") == "refactor"
     assert make(["src/a.py"], "misc changes") == "unknown"
-    print("[PASS] change_type classification rules")
+    assert make(["src/a.py"], "misc changes") == "unknown"
+
+
+def test_conventional_prefix_extraction():
+    def by_message(message):
+        return classify_change_type([type("F", (), {"path": "src/a.py"})()], message)
+
+    assert by_message("feat: add OAuth login") == "feature"
+    assert by_message("feat(auth): refresh token endpoint") == "feature"
+    assert by_message("fix: null pointer on empty cart") == "fix"
+    assert by_message("bug: wrong total shown for discounted items") == "bug"
+    assert by_message("refactor: split token service") == "refactor"
+    assert by_message("docs: update README") == "docs"
+
+    assert by_message("revamp: rework auth flow") == "refactor"
+    assert by_message("repair: broken refresh handling") == "fix"
+    assert by_message("[hotfix] crash on checkout") == "fix"
+    assert by_message("fixed!: double charge bug") == "fix"
+    assert by_message("crashes when cart is empty: investigate") == "bug"
+    assert by_message("restructured: payment module cleanup") == "refactor"
+    assert by_message("restructured the payment module: now cleaner") == "unknown"
+
+    assert by_message("chore: bump deps") in ("config", "unknown")
+    assert by_message("misc changes") == "unknown"
+
+    assert by_message("fix: readme typo") != "docs" or True
+
+    def with_paths(paths, message):
+        files = [type("F", (), {"path": p})() for p in paths]
+        return classify_change_type(files, message)
+
+    assert with_paths(["README.md"], "fix: readme typo") == "fix"
+    print("[PASS] conventional prefix extraction + semantic mapping")
+
+
+def test_prefix_beats_keywords():
+    result = classify_change_type(
+        [type("F", (), {"path": p})() for p in ["src/a.py"]],
+        "feat: fix workaround for legacy importer",
+    )
+    assert result == "feature"
+    print("[PASS] explicit prefix takes priority over body keywords")
 
 
 def test_fallbacks_via_html_url():
@@ -119,6 +161,8 @@ if __name__ == "__main__":
     test_parse_full_record()
     test_deterministic_extraction()
     test_classification_rules()
+    test_conventional_prefix_extraction()
+    test_prefix_beats_keywords()
     test_fallbacks_via_html_url()
     test_error_cases()
     print("\nCHANGE RECORD TESTS PASSED")

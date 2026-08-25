@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import logging
 import os
 import re
@@ -16,7 +17,7 @@ GITHUB_API_BASE = "https://api.github.com"
 _RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
 
 FileStatus = Literal["added", "modified", "removed", "renamed"]
-ChangeType = Literal["feature", "bugfix", "refactor", "config", "docs", "test", "unknown"]
+ChangeType = Literal["feature", "refactor", "fix", "bug", "config", "docs", "test", "unknown"]
 EvidenceType = Literal["file_change", "function_change", "dependency", "project_context", "previous_commit"]
 
 _DEPENDENCY_MANIFESTS = {
@@ -32,12 +33,83 @@ _DEPENDENCY_MANIFESTS = {
 
 _HUNK_FUNCTION = re.compile(r"@@[^@]*@@\s*(?:async\s+)?def\s+([A-Za-z_]\w*)")
 _ADDED_FUNCTION = re.compile(r"^\+\s*(?:async\s+)?def\s+([A-Za-z_]\w*)")
-_BUGFIX_RE = re.compile(r"\b(fix(es|ed)?|bugfix|bug|hotfix|patch|resolve[sd]?)\b")
+_FIX_RE = re.compile(r"\b(fix(es|ed|ing)?|bugfix|hotfix|patch(ed|es)?|repair(ed|s)?|mend(ed|s)?|correct(ed)?|resolve[sd]?)\b")
+_BUG_RE = re.compile(r"\b(bug(s|gy)?|crash(es|ed|ing)?|defect(ive)?|regression)\b")
 _REFACTOR_RE = re.compile(r"\b(refactor|clean\s?up|rename|restructure|moved?)\b")
 _FEATURE_RE = re.compile(r"\b(feat(:|\s)|feature|add(s|ed)?|implement|introduce|support)\b")
 _CONFIG_SUFFIXES = (".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".lock", ".env", ".properties")
 _CONFIG_BASENAMES = {"dockerfile", "makefile", ".gitignore", ".editorconfig"}
 _DOC_SUFFIXES = (".md", ".rst", ".txt")
+
+PREFIX_TYPE_MAP: dict[str, ChangeType] = {
+    "feat": "feature",
+    "feature": "feature",
+    "add": "feature",
+    "added": "feature",
+    "adds": "feature",
+    "new": "feature",
+    "create": "feature",
+    "created": "feature",
+    "implement": "feature",
+    "introduce": "feature",
+    "initial": "feature",
+    "support": "feature",
+    "fix": "fix",
+    "fixed": "fix",
+    "fixes": "fix",
+    "fixing": "fix",
+    "bugfix": "fix",
+    "hotfix": "fix",
+    "patch": "fix",
+    "patched": "fix",
+    "repair": "fix",
+    "repaired": "fix",
+    "mend": "fix",
+    "correct": "fix",
+    "corrected": "fix",
+    "resolve": "fix",
+    "resolved": "fix",
+    "overhaul": "refactor",
+    "bug": "bug",
+    "bugs": "bug",
+    "crash": "bug",
+    "crashes": "bug",
+    "defect": "bug",
+    "regression": "bug",
+    "refactor": "refactor",
+    "refactoring": "refactor",
+    "revamp": "refactor",
+    "revamped": "refactor",
+    "rework": "refactor",
+    "reworked": "refactor",
+    "cleanup": "refactor",
+    "clean": "refactor",
+    "tidy": "refactor",
+    "restructure": "refactor",
+    "rename": "refactor",
+    "renamed": "refactor",
+    "move": "refactor",
+    "moved": "refactor",
+    "simplify": "refactor",
+    "polish": "refactor",
+    "docs": "docs",
+    "doc": "docs",
+    "documentation": "docs",
+    "readme": "docs",
+    "test": "test",
+    "tests": "test",
+    "testing": "test",
+    "config": "config",
+    "configuration": "config",
+    "ci": "config",
+    "build": "config",
+    "deps": "config",
+    "dependencies": "config",
+}
+
+_COMMIT_COLON_PREFIX = re.compile(r"^\s*([a-zA-Z][a-zA-Z0-9_+\-]{2,24})(?:\([^)]{0,80}\))?!?\s*:")
+_COMMIT_BRACKET_PREFIX = re.compile(r"^\s*\[([a-zA-Z][a-zA-Z0-9_+\-]{2,24})\]")
+_FUZZY_PREFIX_CUTOFF = 0.8
 
 
 class ChangedFile(BaseModel):
@@ -182,6 +254,13 @@ def classify_change_type(record_or_files: Any, message: str = "") -> ChangeType:
     else:
         paths = [getattr(f, "path", str(f)) for f in record_or_files]
 
+    subject = message.splitlines()[0].strip() if message.strip() else ""
+    prefix_token = _extract_commit_prefix(subject)
+    if prefix_token:
+        mapped = _resolve_prefix_token(prefix_token)
+        if mapped is not None:
+            return mapped
+
     if paths and all(_is_doc(p) for p in paths):
         return "docs"
     if paths and all(_is_test(p) for p in paths):
@@ -190,13 +269,34 @@ def classify_change_type(record_or_files: Any, message: str = "") -> ChangeType:
         return "config"
 
     msg = message.lower()
-    if _BUGFIX_RE.search(msg):
-        return "bugfix"
+    if _FIX_RE.search(msg):
+        return "fix"
+    if _BUG_RE.search(msg):
+        return "bug"
     if _REFACTOR_RE.search(msg):
         return "refactor"
     if _FEATURE_RE.search(msg):
         return "feature"
     return "unknown"
+
+
+def _extract_commit_prefix(subject: str) -> str:
+    if not subject:
+        return ""
+    match = _COMMIT_COLON_PREFIX.match(subject) or _COMMIT_BRACKET_PREFIX.match(subject)
+    return match.group(1).lower() if match else ""
+
+
+def _resolve_prefix_token(token: str) -> Optional[ChangeType]:
+    if token in PREFIX_TYPE_MAP:
+        return PREFIX_TYPE_MAP[token]
+    for known, change_type in PREFIX_TYPE_MAP.items():
+        if len(known) >= 4 and (token.startswith(known) or known.startswith(token)):
+            return change_type
+    close = difflib.get_close_matches(token, PREFIX_TYPE_MAP.keys(), n=1, cutoff=_FUZZY_PREFIX_CUTOFF)
+    if close:
+        return PREFIX_TYPE_MAP[close[0]]
+    return None
 
 
 def build_evidence(changed_files: list[ChangedFile]) -> list[Evidence]:
@@ -253,11 +353,18 @@ def _extract_functions(patch: Optional[str]) -> list[str]:
 
 
 def _extract_components(changed_files: list[ChangedFile]) -> list[str]:
+    try:
+        from utils.component_extractor import extract_component_root
+    except ImportError:
+        def extract_component_root(path: str) -> str:
+            parts = path.replace("\\", "/").split("/")
+            return parts[0] if len(parts) > 1 else ""
+
     components: list[str] = []
     for changed in changed_files:
-        parts = changed.path.split("/")
-        if len(parts) > 1 and parts[0] not in components:
-            components.append(parts[0])
+        root = extract_component_root(changed.path)
+        if root and root not in components:
+            components.append(root)
     return components
 
 
