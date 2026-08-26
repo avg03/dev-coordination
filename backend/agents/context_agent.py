@@ -101,29 +101,32 @@ class ContextAgent:
             return {"status": "error", "error": f"invalid project_context: {exc}"}
 
         output = self._compose_output(analysis)
-        document_id = self.persist(output)
+        document_id = self.persist(output, document_id=getattr(self, "_pending_document_id", None))
         self.saved_document_id = document_id
         self.saved_by_tool = True
         return {"status": "success", "document_id": document_id}
 
-    def analyze_and_save(self, description: str) -> tuple[ProjectContextOutput, str, bool]:
+    def analyze_and_save(
+        self, description: str, document_id: str | None = None
+    ) -> tuple[ProjectContextOutput, str, bool]:
         if not description or not description.strip():
             raise ValueError("Project description cannot be empty.")
 
         self.saved_document_id = None
         self.saved_by_tool = False
         self._current_description = description
+        self._pending_document_id = document_id
 
         events = asyncio.run(self._run_agent(description))
         analysis = self._extract_analysis(events)
         output = self._compose_output(analysis)
 
-        document_id = self.saved_document_id
-        if document_id is None:
+        resolved_id = self.saved_document_id
+        if resolved_id is None:
             logger.info("Agent did not call save_firestore; using fallback save")
-            document_id = self.persist(output)
+            resolved_id = self.persist(output, document_id=document_id)
 
-        return output, document_id, self.saved_by_tool
+        return output, resolved_id, self.saved_by_tool
 
     async def _run_agent(self, description: str) -> list[Event]:
         user_id = "user"
@@ -199,13 +202,15 @@ class ContextAgent:
             self._firestore = firestore.Client(**kwargs)
         return self._firestore
 
-    def persist(self, output: ProjectContextOutput) -> str:
-        document_id = slugify(output.project.name)
+    def persist(
+        self, output: ProjectContextOutput, document_id: str | None = None
+    ) -> str:
+        resolved_id = document_id if document_id else slugify(output.project.name)
         payload = output.model_dump(mode="json")
         payload["saved_at"] = datetime.now(timezone.utc).isoformat()
-        self.firestore_client.collection(PROJECT_CONTEXTS_COLLECTION).document(document_id).set(payload)
-        logger.info("Saved project context %s", document_id)
-        return document_id
+        self.firestore_client.collection(PROJECT_CONTEXTS_COLLECTION).document(resolved_id).set(payload)
+        logger.info("Saved project context %s", resolved_id)
+        return resolved_id
 
 
 def main(argv: Optional[list[str]] = None) -> int:
