@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -105,24 +106,26 @@ class Architecture(_BaseModel):
 
 
 class Stakeholder(_BaseModel):
-    id: str = Field(default="", description="Unique stakeholder identifier.")
-    name: str = Field(default="", description="Person or role name.")
-    role: str = Field(default="", description="Role in the organization, e.g. backend engineer.")
+    name: str = Field(default="", description="Person name.")
+    role: str = Field(default="", description="Role in the organization.")
     team: str = Field(default="", description="Team this stakeholder belongs to.")
-    responsibilities: list[str] = Field(default_factory=list)
-    owned_components: list[str] = Field(default_factory=list)
-    communication_preference: CommunicationPreference = Field(
-        default=CommunicationPreference.BOTH,
+    slack_user_id: str | None = Field(default=None, description="Slack user ID for DM (e.g., U0XXXXXX).")
+    slack_channel_id: str | None = Field(default=None, description="Slack channel ID override for this stakeholder.")
+    communication_preference: Literal["group", "personal", "both"] = Field(
+        default="both",
         description="Whether they should be reached via group channels, personal DMs or both.",
     )
 
 
 class TeamContext(_BaseModel):
-    team_id: str = Field(default="", description="Unique team identifier.")
     name: str = Field(default="", description="Team name.")
-    responsibilities: list[str] = Field(default_factory=list)
-    owned_components: list[str] = Field(default_factory=list)
-    members: list[str] = Field(default_factory=list)
+    responsibilities: list[str] = Field(default_factory=list, description="Team responsibilities.")
+    owned_components: list[str] = Field(
+        default_factory=list, description="Components owned by the team."
+    )
+    slack_channel_id: str = Field(
+        default="", description="Slack channel ID for the team (e.g., C0XXXXXX)."
+    )
 
 
 class PlannedDependency(_BaseModel):
@@ -176,10 +179,10 @@ Analyze and extract, at minimum:
 3. architecture: the main components (id, name, type, description,
    repository_paths, responsible_teams) and the dependencies between them
    (source_component, target_component, relationship, description).
-4. stakeholders: people or roles involved (id, name, role, team,
-   responsibilities, owned_components, communication_preference).
-5. team_context: the teams involved (team_id, name, responsibilities,
-   owned_components, members).
+4. stakeholders: people or roles involved (name, role, team,
+    slack_user_id, slack_channel_id, communication_preference).
+5. team_context: the teams involved (name, responsibilities,
+    owned_components, slack_channel_id).
 6. planned_dependencies: task ordering dependencies (description,
    source_task, dependent_task, affected_team).
 7. success_criteria: measurable outcomes that would mean the work succeeded.
