@@ -247,14 +247,41 @@ class CommunicationAgent:
     def _mock_send_all(self, messages: list[SlackMessage]) -> int:
         count = 0
         for msg in messages:
-            self._mock_send_slack(msg.channel, msg.text, msg.mode, msg.recipient, msg.team)
+            self._send_slack(msg.channel, msg.text, msg.mode, msg.recipient, msg.team)
             count += 1
         return count
 
-    def _mock_send_slack(
+    def _send_slack(
         self, channel: str, text: str, mode: str, recipient: str, team: str
     ) -> dict:
-        """Mock Slack sender — logs instead of calling real Slack API. Replace with slack_sdk.WebClient later."""
+        """Send via Slack API with mock fallback. Uses services.slack_service if token present."""
+        try:
+            from services.slack_service import send_slack_message
+        except ImportError:
+            try:
+                from backend.services.slack_service import send_slack_message
+            except ImportError:
+                send_slack_message = None  # type: ignore
+
+        if send_slack_message:
+            result = send_slack_message(channel=channel, text=text)
+            entry = {
+                "channel": channel or "(no-channel)",
+                "recipient": recipient,
+                "team": team,
+                "mode": mode,
+                "text_preview": text[:120].replace("\n", " ") + ("..." if len(text) > 120 else ""),
+                "status": result.get("status", "mock_sent"),
+                "slack_ts": result.get("ts"),
+            }
+            self._sent_messages.append(entry)
+            if result.get("status") == "sent":
+                logger.info("[SLACK] %s -> %s (%s): %s", team, channel, mode, entry["text_preview"])
+            else:
+                logger.info("[MOCK SLACK] %s -> %s (%s): %s", team, channel or recipient, mode, entry["text_preview"])
+            return result
+
+        # Fallback mock if service not importable
         entry = {
             "channel": channel or "(no-channel)",
             "recipient": recipient,
@@ -272,6 +299,10 @@ class CommunicationAgent:
             entry["text_preview"],
         )
         return {"status": "mock_sent", "channel": channel, "ok": True}
+
+    # Kept for backward compat
+    def _mock_send_slack(self, channel: str, text: str, mode: str, recipient: str, team: str) -> dict:
+        return self._send_slack(channel, text, mode, recipient, team)
 
     def persist_communication(
         self, project_id: str, commit_sha: str, result: CommunicationResult

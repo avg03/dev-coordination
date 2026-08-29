@@ -10,3 +10,4 @@ google-cloud-firestore
 google-cloud-pubsub
 google-cloud-storage
 python-dotenv
+slack_sdk
