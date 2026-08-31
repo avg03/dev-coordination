@@ -24,10 +24,12 @@ from urllib.parse import urljoin
 import httpx
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration — keep same Pub/Sub worker, increase frontend wait to 60s for
+# project context (Gemini ADK) which often exceeds 30s.
 # ---------------------------------------------------------------------------
 
-DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_TIMEOUT_SECONDS = 60.0
+PROJECT_CONTEXT_TIMEOUT_SECONDS = 60.0
 
 
 class BackendApiError(RuntimeError):
@@ -171,7 +173,7 @@ def create_project_context(project_id: str, project_description: str) -> dict[st
         "project_id": project_id.strip(),
         "project_description": project_description.strip(),
     }
-    result = _request("POST", "/api/projects/context", json=payload)
+    result = _request("POST", "/api/projects/context", json=payload, timeout=PROJECT_CONTEXT_TIMEOUT_SECONDS)
     # Backend returns object; ensure dict
     if isinstance(result, list):
         return {"data": result}
