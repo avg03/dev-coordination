@@ -36,6 +36,7 @@ PROJECT_CONTEXTS_COLLECTION = "project_contexts"
 
 
 class SlackMessage(BaseModel):
+    id: str = Field(default="", description="Stable message identifier, e.g., msg_1")
     recipient: str = Field(description="Stakeholder name or team name")
     team: str = Field(description="Team of the recipient")
     channel: str = Field(description="Slack channel ID or user ID the message was sent to")
@@ -75,6 +76,7 @@ Rules:
 - Every message must cite evidence from the task.
 - Respect communication_preference: if stakeholder prefers group, use team channel; if personal, use DM; if both, prefer the task's mode.
 - Do not skip members that have a slack identifier and are linked to a task.
+- Assign each SlackMessage a stable id like msg_1, msg_2, etc., in order.
 
 Return ONLY the CommunicationResult JSON matching the output_schema, containing one SlackMessage per member linked to the change.
 """
@@ -208,7 +210,12 @@ class CommunicationAgent:
             text = self._event_text(event)
             if text:
                 try:
-                    return CommunicationResult.model_validate(self._coerce(text))
+                    result = CommunicationResult.model_validate(self._coerce(text))
+                    # Ensure stable ids like msg_1, msg_2 for selection
+                    for idx, msg in enumerate(result.messages, start=1):
+                        if not msg.id:
+                            msg.id = f"msg_{idx}"
+                    return result
                 except (ValueError, TypeError, json.JSONDecodeError):
                     continue
         raise RuntimeError("Could not extract CommunicationResult from agent response.")
