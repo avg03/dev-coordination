@@ -9,8 +9,13 @@ from pydantic import BaseModel, Field
 from agents.communication_agent import CommunicationAgent, CommunicationResult, SlackMessage
 from agents.coordination_agent import CoordinationAgent, CoordinationPlan
 from agents.impact_analysis_agent import ImpactReport
+from agents.supervisor_agent import SupervisionResult, SupervisorAgent
+from blast_radius.blast_radius_service import BlastRadiusService
+from blast_radius.diff_analyzer import parse_pr_files
+from blast_radius.models import ANALYSIS_VERSION, BlastRadiusReport, ChangedFileInfo
 from github_infrastructure.github_service import GitHubService
 from project_context.models import ProjectContextOutput
+from security.idempotency import ClaimStatus, IdempotencyManager, StepInProgressError
 
 try:
     from agents.change_analysis_agent import EnrichedChangeRecord
@@ -26,6 +31,7 @@ class PREvent(BaseModel):
     repository: str = Field(description="Repository name")
     pr_number: int = Field(description="Pull request number")
     action: str = Field(default="opened", description="PR action: opened, synchronize, reopened, closed")
+    head_sha: str = Field(default="", description="PR head SHA — changes the idempotency key so updated PRs re-analyze")
 
 
 class PRAnalysisInput(BaseModel):
@@ -54,6 +60,9 @@ class PRWorkflow:
         impact_agent: Optional[Any] = None,
         coordinator_agent: Optional[Any] = None,
         communication_agent: Optional[Any] = None,
+        supervisor_agent: Optional[Any] = None,
+        idempotency_manager: Optional[IdempotencyManager] = None,
+        blast_radius_service: Optional[Any] = None,
         project: Optional[str] = None,
         database: Optional[str] = None,
     ) -> None:
@@ -66,6 +75,9 @@ class PRWorkflow:
         self.impact_agent = impact_agent
         self.coordinator_agent = coordinator_agent
         self.communication_agent = communication_agent
+        self.supervisor_agent = supervisor_agent
+        self.blast_radius_service = blast_radius_service
+        self._idempotency = idempotency_manager
         self._firestore = None
 
     @property
@@ -79,16 +91,154 @@ class PRWorkflow:
             self._firestore = firestore.Client(**kwargs)
         return self._firestore
 
+    async def _load_existing_bundle(self, pr_event: PREvent) -> CommunicationBundle | None:
+        """Fast path: if this PR head already has a communications doc, skip LLM re-runs.
+
+        A changed head SHA means new work — the workflow re-runs (idempotency
+        keys incorporate the head SHA, so each head analyzes exactly once).
+        """
+        import asyncio
+
+        def _sync_check():
+            base = self.firestore_client.collection("projects").document(pr_event.project_id)
+            comm_snap = base.collection("communications").document(str(pr_event.pr_number)).get()
+            if not comm_snap.exists:
+                return None
+            data = comm_snap.to_dict() or {}
+            stored_head = str(data.get("head_sha", "") or "")
+            if pr_event.head_sha and stored_head and stored_head != pr_event.head_sha:
+                logger.info(
+                    "PR %s head changed (%s -> %s) — re-running workflow",
+                    pr_event.pr_number,
+                    stored_head[:10],
+                    pr_event.head_sha[:10],
+                )
+                return None
+            try:
+                return CommunicationBundle.model_validate(data)
+            except Exception:
+                return None
+
+        return await asyncio.to_thread(_sync_check)
+
+    def _get_idempotency_manager(self) -> IdempotencyManager:
+        if self._idempotency is None:
+            from security.idempotency import get_idempotency_manager
+
+            self._idempotency = get_idempotency_manager()
+        return self._idempotency
+
+    async def _run_step(
+        self,
+        step_name: str,
+        pr_event: PREvent,
+        workflow_id: str,
+        input_fingerprint: dict[str, Any],
+        execute,
+        model_cls,
+    ):
+        """Claim -> execute -> persist result -> mark COMPLETED (spec §8 ordering).
+
+        The full result is stored inside the idempotency record before it is
+        marked COMPLETED, so a retry after a crash returns the stored result
+        instead of re-executing the (LLM) step.
+        """
+        import asyncio
+
+        idem = self._get_idempotency_manager()
+        key = idem.build_key(pr_event.project_id, workflow_id, step_name, input_fingerprint)
+        outcome = await asyncio.to_thread(
+            idem.claim,
+            key,
+            workflow_id=workflow_id,
+            project_id=pr_event.project_id,
+            step_name=step_name,
+            input_payload=input_fingerprint,
+        )
+        if outcome.status == ClaimStatus.COMPLETED:
+            logger.info("Step %s already completed for %s — reusing stored result", step_name, workflow_id)
+            return model_cls.model_validate(outcome.result or {})
+        if outcome.status == ClaimStatus.IN_PROGRESS:
+            raise StepInProgressError(f"{step_name} is in progress for {workflow_id}")
+
+        try:
+            result = await execute()
+        except Exception as exc:
+            await asyncio.to_thread(idem.fail, key, str(exc))
+            raise
+
+        await asyncio.to_thread(idem.complete, key, result.model_dump(mode="json"))
+        return result
+
     async def run(self, pr_event: PREvent) -> CommunicationBundle:
+        # Fast path: same head SHA already analyzed -> skip LLM calls (prevents 429 loops)
+        existing = await self._load_existing_bundle(pr_event)
+        if existing is not None:
+            logger.info("PR %s already has communications bundle for %s — skipping LLM re-run", pr_event.pr_number, pr_event.project_id)
+            return existing
+
+        workflow_id = f"pr:{pr_event.project_id}:{pr_event.pr_number}:{pr_event.head_sha or 'na'}"
         commits = await self._fetch_pr_commits(pr_event)
         project_context = await self._load_project_context(pr_event.project_id)
         enriched_changes = await self._load_enriched_changes(pr_event.project_id, commits)
         pr_input = self._build_pr_analysis_input(project_context, enriched_changes, pr_event)
 
-        # Execute agents sequentially - workflow orchestrates, agents don't call each other
-        impact_report = await self._run_impact_agent(pr_input)
-        coordination_plan = await self._run_coordinator_agent(pr_input, impact_report)
-        communication_bundle = await self._run_communication_agent(pr_input, coordination_plan)
+        # Input fingerprint: any change (new head, new commits, updated context)
+        # produces different idempotency keys, so the new input is analyzed.
+        input_fingerprint = {
+            "pr_number": pr_event.pr_number,
+            "head_sha": pr_event.head_sha,
+            "action": pr_event.action,
+            "commit_shas": commits,
+            "context_updated_at": project_context.metadata.updated_at,
+            "enriched_shas": [c.commit_sha for c in enriched_changes],
+        }
+
+        # Deterministic blast radius FIRST: sandboxed static analysis produces
+        # the evidence the Impact Agent reasons over (never the reverse).
+        # Keyed by PR head SHA + context version + analysis version.
+        blast_radius_fingerprint = {
+            "pr_number": pr_event.pr_number,
+            "head_sha": pr_event.head_sha,
+            "context_updated_at": project_context.metadata.updated_at,
+            "analysis_version": ANALYSIS_VERSION,
+        }
+        blast_report = await self._run_blast_radius_step(
+            pr_event, workflow_id, blast_radius_fingerprint, project_context
+        )
+
+        # Execute agents sequentially - workflow orchestrates, agents don't call each other.
+        # Agents reason and persist drafts; nothing here sends Slack.
+        impact_report = await self._run_step(
+            "impact:analyze", pr_event, workflow_id, input_fingerprint,
+            lambda: self._run_impact_agent(pr_input, blast_report), ImpactReport,
+        )
+        self._reconcile_blast_radius(impact_report, blast_report)
+        coordination_plan = await self._run_step(
+            "coordination:create", pr_event, workflow_id, input_fingerprint,
+            lambda: self._run_coordinator_agent(pr_input, impact_report), CoordinationPlan,
+        )
+        communication_result = await self._run_step(
+            "communication:generate", pr_event, workflow_id, input_fingerprint,
+            lambda: self._run_communication_agent(pr_input, coordination_plan), CommunicationResult,
+        )
+        supervision = await self._run_step(
+            "communication:supervise", pr_event, workflow_id, input_fingerprint,
+            lambda: self._run_supervisor_agent(pr_input, coordination_plan, communication_result),
+            SupervisionResult,
+        )
+
+        final_messages = supervision.final_messages or communication_result.messages
+        communication_bundle = CommunicationBundle(
+            project_id=pr_event.project_id,
+            pr_number=pr_event.pr_number,
+            owner=pr_event.owner,
+            repository=pr_event.repository,
+            coordination_plan=coordination_plan,
+            communication_result=communication_result,
+            messages=list(final_messages),
+            summary=supervision.summary or communication_result.summary,
+        )
 
         await self._persist_outputs(pr_event, impact_report, coordination_plan, communication_bundle)
 
@@ -147,7 +297,87 @@ class PRWorkflow:
             enriched_changes=enriched_changes,
         )
 
-    async def _run_impact_agent(self, pr_input: PRAnalysisInput) -> ImpactReport:
+    def _get_blast_radius_service(self) -> BlastRadiusService:
+        if self.blast_radius_service is None:
+            self.blast_radius_service = BlastRadiusService()
+        return self.blast_radius_service
+
+    async def _run_blast_radius_step(
+        self,
+        pr_event: PREvent,
+        workflow_id: str,
+        fingerprint: dict[str, Any],
+        project_context: ProjectContextOutput,
+    ) -> BlastRadiusReport:
+        """Idempotent blast_radius:analyze step (spec: keyed by PR head SHA +
+        project/context version + analysis version). Result is persisted to
+        projects/{id}/blast_radius/{pr_number} BEFORE the record is marked
+        COMPLETED, so retries return the stored report and the sandbox is
+        never re-provisioned for the same key."""
+        import asyncio
+
+        async def _execute() -> BlastRadiusReport:
+            raw_files = await self.github_service.fetch_pr_files(
+                pr_event.owner, pr_event.repository, pr_event.pr_number
+            )
+
+            def _sync() -> BlastRadiusReport:
+                changed_files = parse_pr_files(raw_files)
+                patches = {
+                    str(f.get("filename")): str(f.get("patch") or "")
+                    for f in raw_files
+                    if f.get("filename") and f.get("patch")
+                }
+                service = self._get_blast_radius_service()
+                return service.analyze(
+                    project_id=pr_event.project_id,
+                    pr_number=pr_event.pr_number,
+                    repo=f"{pr_event.owner}/{pr_event.repository}",
+                    head_sha=pr_event.head_sha,
+                    changed_files=changed_files,
+                    project_context=project_context.model_dump(mode="json"),
+                    patches=patches,
+                )
+
+            report = await asyncio.to_thread(_sync)
+            await asyncio.to_thread(self._persist_blast_radius, pr_event, report)
+            return report
+
+        return await self._run_step(
+            "blast_radius:analyze",
+            pr_event,
+            workflow_id,
+            fingerprint,
+            _execute,
+            BlastRadiusReport,
+        )
+
+    def _persist_blast_radius(self, pr_event: PREvent, report: BlastRadiusReport) -> None:
+        from datetime import datetime, timezone
+
+        self.firestore_client.collection("projects").document(pr_event.project_id).collection(
+            "blast_radius"
+        ).document(str(pr_event.pr_number)).set(
+            {**report.model_dump(mode="json"), "persisted_at": datetime.now(timezone.utc).isoformat()}
+        )
+
+    def _reconcile_blast_radius(self, impact_report: ImpactReport, blast_report: Optional[BlastRadiusReport]) -> None:
+        """Evidence integrity: the Impact Agent must not drop deterministic
+        blast-radius entries — union any missing ones back from the stored report."""
+        if blast_report is None:
+            return
+        present_ids = {entry.entity_id for entry in impact_report.blast_radius}
+        missing = [entry for entry in blast_report.entries if entry.entity_id not in present_ids]
+        if missing:
+            logger.info(
+                "Re-attaching %d blast radius entries dropped by the Impact Agent",
+                len(missing),
+            )
+        impact_report.blast_radius = list(impact_report.blast_radius) + missing
+        if not impact_report.changed_components:
+            impact_report.changed_components = list(blast_report.changed_components)
+
+    async def _run_impact_agent(self, pr_input: PRAnalysisInput, blast_report: Optional[BlastRadiusReport] = None) -> ImpactReport:
         # Delegate to ImpactAgent - workflow does not contain prompt engineering
         agent = self.impact_agent or self._get_impact_agent()
         # For PR, we create a synthetic aggregated impact via the agent's PR-aware method if available,
@@ -161,7 +391,9 @@ class PRWorkflow:
         first = pr_input.enriched_changes[0]
         # Ensure enriched change is persisted so tool fetch succeeds
         await self._ensure_enriched_persisted(pr_input.project_id, first)
-        report, _, _ = await self._to_thread(agent.analyze, pr_input.project_id, first.commit_sha)
+        report, _, _ = await self._to_thread(
+            agent.analyze, pr_input.project_id, first.commit_sha, pr_input.pr_number
+        )
         # Re-key report to PR number for persistence
         report.project_id = pr_input.project_id
         # keep original commit_sha for traceability, but workflow will persist under pr_number
@@ -183,36 +415,37 @@ class PRWorkflow:
 
     async def _run_communication_agent(
         self, pr_input: PRAnalysisInput, coordination_plan: CoordinationPlan
-    ) -> CommunicationBundle:
+    ) -> CommunicationResult:
+        """Draft messages only — never sends. Delivery goes through the approval endpoint."""
         agent = self.communication_agent or self._get_communication_agent()
         if hasattr(agent, "analyze_pr"):
             return await agent.analyze_pr(pr_input, coordination_plan)  # type: ignore
         await self._ensure_coordination_persisted(pr_input.project_id, coordination_plan)
         surrogate_sha = pr_input.enriched_changes[0].commit_sha if pr_input.enriched_changes else str(pr_input.pr_number)
-        result, _, _ = await self._to_thread(agent.analyze, pr_input.project_id, surrogate_sha) if hasattr(agent, "analyze") else (None, None, None)
-        # Adapt CommunicationResult to CommunicationBundle for PR
-        if isinstance(result, CommunicationResult):
-            bundle = CommunicationBundle(
-                project_id=pr_input.project_id,
-                pr_number=pr_input.pr_number,
-                owner=pr_input.project_context.project.name,
-                repository="",
-                impact_report=None,
-                coordination_plan=coordination_plan,
-                communication_result=result,
-                messages=result.messages,
-                summary=result.summary,
-            )
-            return bundle
-        # Fallback bundle construction
-        return CommunicationBundle(
-            project_id=pr_input.project_id,
-            pr_number=pr_input.pr_number,
-            owner="",
-            repository="",
-            coordination_plan=coordination_plan,
-            messages=[],
-            summary=coordination_plan.summary,
+        result = await self._to_thread(agent.analyze, pr_input.project_id, surrogate_sha)
+        if not isinstance(result, CommunicationResult):
+            raise ValueError("CommunicationAgent did not return a CommunicationResult")
+        return result
+
+    async def _run_supervisor_agent(
+        self,
+        pr_input: PRAnalysisInput,
+        coordination_plan: CoordinationPlan,
+        communication_result: CommunicationResult,
+    ) -> SupervisionResult:
+        """Supervisor critiques/validates drafts. No send capability."""
+        agent = self.supervisor_agent
+        if agent is None:
+            agent = SupervisorAgent(project=self.project, database=self.database)
+        if hasattr(agent, "analyze_pr"):
+            return await agent.analyze_pr(pr_input, coordination_plan, communication_result)  # type: ignore
+        drafts = [m.model_dump(mode="json") for m in communication_result.messages]
+        return await self._to_thread(
+            agent.analyze,
+            pr_input.project_id,
+            pr_input.pr_number,
+            coordination_plan.summary,
+            drafts,
         )
 
     async def _persist_outputs(
@@ -243,7 +476,7 @@ class PRWorkflow:
             # CommunicationBundle
             comm_payload = communication_bundle.model_dump(mode="json")
             comm_doc = base.collection("communications").document(pr_id)
-            comm_doc.set({**comm_payload, "pr_number": pr_event.pr_number, "persisted_at": pr_payload_time()})
+            comm_doc.set({**comm_payload, "pr_number": pr_event.pr_number, "head_sha": pr_event.head_sha, "persisted_at": pr_payload_time()})
 
         await asyncio.to_thread(_sync_persist)
 

@@ -70,55 +70,55 @@ def process_commit_event(
     return results
 
 
-def _get_single_project_id() -> Optional[str]:
-    """Resolve single project_id for one-repo test. Returns None if no project_context exists."""
+def _get_all_project_ids() -> list[str]:
+    """One-repo test: enrich for every project_context so Work Journey works whichever project_id the UI queries (campuscart, authentication-redesign, etc.)."""
     try:
         store = get_change_store()
         client = store.client
-        # One-repo mode: pick the sole project_context (e.g. campuscart)
-        docs = list(client.collection("project_contexts").limit(1).stream())
+        docs = list(client.collection("project_contexts").stream())
         if docs:
-            return docs[0].id
+            return [d.id for d in docs]
         logger.warning("Enrichment skipped — no project_contexts found. Create one via POST /api/projects/context first.")
-        return None
+        return []
     except Exception as exc:  # pragma: no cover
         logger.warning("Enrichment skipped — could not list project_contexts: %s", exc)
-        return None
+        return []
 
 
 def _try_create_enriched(record: ChangeRecord) -> None:
-    """Create enriched_changes/{sha} under projects/{project_id} without breaking pipeline."""
-    project_id = _get_single_project_id()
-    if not project_id:
+    """Create enriched_changes/{sha} under projects/{project_id} without breaking pipeline — one-repo test writes to all projects."""
+    project_ids = _get_all_project_ids()
+    if not project_ids:
         return
+    # Lazy import once
     try:
-        # Lazy import to avoid circular deps and to keep pipeline importable without ADK
         try:
             from agents.change_analysis_agent import ChangeAnalysisAgent
         except ImportError:
-            try:
-                from backend.agents.change_analysis_agent import ChangeAnalysisAgent  # type: ignore
-            except ImportError as exc:
-                logger.warning("Enrichment skipped — ChangeAnalysisAgent not importable: %s", exc)
-                return
-        agent = ChangeAnalysisAgent(
-            project=settings.gcp_project,
-            database=os.getenv("FIRESTORE_DATABASE", "(default)"),
-        )
-        enriched, path, saved_by_tool = agent.analyze(project_id, record)
-        logger.info(
-            "Enriched record created for %s@%s -> %s (saved_by_tool=%s)",
-            record.repository,
-            record.commit_sha[:10],
-            path,
-            saved_by_tool,
-        )
-    except ValueError as exc:
-        # e.g. project_id empty, commit_sha empty — proper error output, no crash
-        logger.warning("Enrichment skipped (validation): %s", exc)
-    except Exception as exc:  # pragma: no cover
-        # LLM timeout, Firestore error, quota — log and continue; change_records already saved
-        logger.warning("Enrichment failed for %s@%s project=%s: %s", record.repository, record.commit_sha[:10], project_id, exc, exc_info=True)
+            from backend.agents.change_analysis_agent import ChangeAnalysisAgent  # type: ignore
+    except ImportError as exc:
+        logger.warning("Enrichment skipped — ChangeAnalysisAgent not importable: %s", exc)
+        return
+
+    for project_id in project_ids:
+        try:
+            agent = ChangeAnalysisAgent(
+                project=settings.gcp_project,
+                database=os.getenv("FIRESTORE_DATABASE", "(default)"),
+            )
+            enriched, path, saved_by_tool = agent.analyze(project_id, record)
+            logger.info(
+                "Enriched record created for %s@%s -> %s (saved_by_tool=%s)",
+                record.repository,
+                record.commit_sha[:10],
+                path,
+                saved_by_tool,
+            )
+        except ValueError as exc:
+            logger.warning("Enrichment skipped (validation) project=%s: %s", project_id, exc)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Enrichment failed for %s@%s project=%s: %s", record.repository, record.commit_sha[:10], project_id, exc, exc_info=True)
+            # continue to next project_id — one failure must not block others or change_records
 
 
 def _build_and_enrich(

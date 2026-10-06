@@ -18,6 +18,25 @@ from pydantic import BaseModel, Field
 
 from github_infrastructure.change_records import ChangeRecord
 from github_infrastructure.config import settings
+from security.guard import make_before_tool_guard
+from security.identities import AgentIdentity
+
+# Fix ADK output serialization: ChangeRecord/EnrichedChangeRecord contain datetime `timestamp`
+# which ADK's _output_schema_processor does json.dumps(response) without handling datetime.
+# Patch json.dumps globally to handle datetime via str() so both input and output are JSON-safe
+# without modifying ChangeRecord schema or manual timestamp conversion.
+import json as _json_module
+
+if not getattr(_json_module, "_adk_datetime_patched", False):
+    _orig_dumps = _json_module.dumps
+
+    def _adk_patched_dumps(obj, *args, **kwargs):
+        if "default" not in kwargs:
+            kwargs["default"] = str
+        return _orig_dumps(obj, *args, **kwargs)
+
+    _json_module.dumps = _adk_patched_dumps  # type: ignore
+    _json_module._adk_datetime_patched = True  # type: ignore
 
 try:
     from project_context.models import ProjectContextOutput
@@ -101,6 +120,7 @@ class ChangeAnalysisAgent:
             instruction=CHANGE_ANALYSIS_INSTRUCTION + SAVE_TOOL_INSTRUCTION,
             output_schema=EnrichedChangeRecord,
             tools=[self._get_project_context_tool, self._save_enriched_change_tool],
+            before_tool_callback=make_before_tool_guard(AgentIdentity.CHANGE_ANALYSIS_AGENT),
         )
 
     def _get_project_context_tool(self, project_id: str) -> dict:
@@ -252,3 +272,4 @@ class ChangeAnalysisAgent:
         path = f"projects/{project_id}/enriched_changes/{enriched.commit_sha}"
         logger.info("Saved enriched change %s", path)
         return path
+

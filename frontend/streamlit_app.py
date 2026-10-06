@@ -313,6 +313,75 @@ def _render_impact_report(impact: dict | None) -> None:
         st.caption("No evidence.")
 
 
+def _render_blast_radius(impact: dict | None) -> None:
+    """Blast Radius section — deterministic static-analysis evidence attached
+    to the impact report. Shows who/what is affected and WHY."""
+    if not isinstance(impact, dict):
+        return
+    entries = impact.get("blast_radius") or []
+    changed_components = impact.get("changed_components") or []
+    if not entries and not changed_components:
+        return
+
+    st.divider()
+    st.markdown("#### 💥 Blast Radius")
+    incomplete = impact.get("incomplete")
+    if isinstance(incomplete, bool) and incomplete:
+        st.caption("⚠️ Static analysis incomplete — evidence may be partial.")
+
+    if changed_components:
+        st.markdown("**Affected components**")
+        st.write(" · ".join(f"`{c}`" for c in changed_components))
+
+    level_order = [
+        ("direct", "Direct impact"),
+        ("dependency", "Dependency impact"),
+        ("indirect", "Indirect impact"),
+        ("workflow", "Workflow impact"),
+    ]
+    level_badge = {
+        "direct": "🔴",
+        "dependency": "🟠",
+        "indirect": "🟡",
+        "workflow": "🔵",
+    }
+    grouped: dict[str, list[dict]] = {}
+    for entry in entries:
+        if isinstance(entry, dict):
+            grouped.setdefault(entry.get("impact_level", "indirect"), []).append(entry)
+
+    for level, label in level_order:
+        group = grouped.pop(level, None)
+        if not group:
+            continue
+        st.markdown(f"**{level_badge.get(level, '•')} {label}**")
+        for entry in group:
+            entity_type = entry.get("entity_type", "")
+            icon = {"person": "👤", "team": "👥", "component": "🧩", "workflow": "⚙️"}.get(entity_type, "•")
+            name = entry.get("name") or entry.get("entity_id", "—")
+            itype = entry.get("impact_type", "none")
+            conf = entry.get("confidence")
+            conf_str = f" · confidence {conf:.2f}" if isinstance(conf, (int, float)) else ""
+            line = f"{icon} **{name}** `{entity_type}` — `{itype}`{conf_str}"
+            st.markdown(line)
+            reason = entry.get("reason", "")
+            if reason:
+                st.caption(reason)
+            evidence = entry.get("evidence") or []
+            if evidence:
+                with st.expander("Why? — evidence", expanded=False):
+                    for ev in evidence:
+                        if isinstance(ev, dict):
+                            st.markdown(
+                                f"- `{ev.get('type', '')}` · `{ev.get('source', '')}` — {ev.get('detail', '')}"
+                            )
+
+    for level, group in grouped.items():  # any unexpected levels still shown
+        for entry in group:
+            name = entry.get("name") or entry.get("entity_id", "—")
+            st.markdown(f"• **{name}** — `{entry.get('impact_type', '')}`")
+
+
 def _render_coordination_plan(plan: dict | None) -> None:
     if not plan:
         st.caption("No coordination plan for this PR yet.")
@@ -832,6 +901,7 @@ elif page == "PR Review":
             st.markdown("### A. Impact Report")
             with st.container(border=True):
                 _render_impact_report(review.get("impact_report"))
+                _render_blast_radius(review.get("impact_report"))
                 with st.expander("Raw Impact Report JSON", expanded=False):
                     _json_view(review.get("impact_report"))
 

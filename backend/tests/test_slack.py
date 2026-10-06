@@ -84,31 +84,39 @@ def test_real_slack_if_configured():
     print(f"[PASS] Slack send verified (status={result['status']})")
 
 
-def test_communication_agent_mock():
-    """Verifies CommunicationAgent uses mock path when no real token."""
-    from agents.communication_agent import CommunicationAgent, SlackMessage
+def test_communication_agent_no_send_path():
+    """CommunicationAgent is a pure drafting component — it must have NO send
+    capability. Delivery happens only via the approval endpoint ->
+    PermissionGateway -> SlackExecutor (see tests/test_slack_execution.py)."""
+    from agents.communication_agent import CommunicationAgent
 
     agent = CommunicationAgent(project="test-project", database="test-db")
-    # Don't need real Firestore for this - just test the send wrapper
-    msg = SlackMessage(
-        recipient="Test User",
-        team="backend",
-        channel="C00000000",
-        mode="personal",
-        text="Hello Test User, what changed: auth-service refactor, reason: you own auth-service",
-        evidence=["src/auth.py modified"],
+    for removed in ("_send_slack", "_mock_send_all", "_mock_send_slack"):
+        assert not hasattr(agent, removed), f"CommunicationAgent.{removed} must not exist"
+
+    from security.audit import InMemoryAuditSink
+    from security.gateway import PermissionGateway
+    from security.identities import Action, Resource
+    from security.permissions import AuthorizationRequest
+
+    gw = PermissionGateway(audit_sink=InMemoryAuditSink())
+    decision = gw.authorize(
+        AuthorizationRequest(
+            agent_id="communication_agent",
+            action=Action.SEND,
+            resource=Resource.SLACK,
+            project_id="test-project",
+        )
     )
-    result = agent._send_slack(channel=msg.channel, text=msg.text, mode=msg.mode, recipient=msg.recipient, team=msg.team)
-    assert result["ok"] is True
-    assert result["status"] in ("mock_sent", "sent")
-    print(f"[PASS] CommunicationAgent send wrapper: {result}")
+    assert decision.allowed is False, "communication_agent must never have slack.send"
+    print("[PASS] CommunicationAgent has no send path; gateway denies slack.send")
 
 
 if __name__ == "__main__":
     print("=== Slack Integration Tests ===")
     test_mock_fallback()
     test_real_slack_if_configured()
-    test_communication_agent_mock()
+    test_communication_agent_no_send_path()
     print("\n=== ALL SLACK TESTS PASSED ===")
     print("\nTo enable real Slack:")
     print("  1. Create app at https://api.slack.com/apps -> OAuth & Permissions -> Bot Token Scopes: chat:write, users:read")

@@ -18,6 +18,8 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
 from github_infrastructure.config import settings
+from security.guard import make_before_tool_guard
+from security.identities import AgentIdentity
 
 try:
     from project_context.models import (
@@ -87,6 +89,7 @@ class ContextAgent:
             instruction=CONTEXT_AGENT_INSTRUCTION + SAVE_TOOL_INSTRUCTION,
             output_schema=AgentAnalysisOutput,
             tools=[self._save_firestore_tool],
+            before_tool_callback=make_before_tool_guard(AgentIdentity.CONTEXT_AGENT),
         )
 
     def _save_firestore_tool(self, project_context: dict[str, Any]) -> dict:
@@ -238,3 +241,5 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
