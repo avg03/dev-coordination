@@ -18,11 +18,18 @@ from pydantic import BaseModel, Field
 
 from github_infrastructure.change_records import Evidence
 from github_infrastructure.config import settings
+from security.guard import make_before_tool_guard
+from security.identities import AgentIdentity
 
 try:
     from agents.change_analysis_agent import EnrichedChangeRecord
 except ImportError:
     from agents.change_analysis_agent import EnrichedChangeRecord
+
+try:
+    from blast_radius.models import BlastRadiusEntry
+except ImportError:
+    from blast_radius.models import BlastRadiusEntry
 
 try:
     from project_context.models import ProjectContextOutput
@@ -54,6 +61,9 @@ class ImpactReport(BaseModel):
     risks: list[str] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Deterministic blast-radius evidence (from blast_radius:analyze step).
+    changed_components: list[str] = Field(default_factory=list)
+    blast_radius: list[BlastRadiusEntry] = Field(default_factory=list)
 
 
 IMPACT_ANALYSIS_INSTRUCTION = """
@@ -62,19 +72,29 @@ You are the Impact Analysis Agent. You analyze an EnrichedChangeRecord together 
 Workflow you MUST follow:
 1. Call get_project_context with project_id to fetch the ProjectContext.
 2. Call get_enriched_change with project_id and commit_sha to fetch the EnrichedChangeRecord.
-3. Analyze both to infer:
-   - Affected components: which architecture components are touched, using changed_files and architecture.components.
-   - Which teams are impacted: map affected_components to team_context owned_components and stakeholder responsibilities.
+3. Call get_blast_radius with project_id and pr_number to fetch the deterministic BlastRadiusReport
+   (static sandbox analysis: changed components, dependency traversal, ownership). If it returns an
+   error (e.g. analysis unavailable), proceed without it — do not invent its contents.
+4. Analyze the available evidence to infer:
+   - Affected components: which architecture components are touched, using changed_files,
+     architecture.components, and the blast radius changed_components when available.
+   - blast_radius: when a BlastRadiusReport was fetched, carry its entries into the output. You may
+     adjust impact_type per entry (awareness/action/approval/none) based on the evidence, but you
+     MUST preserve entity_type, entity_id, and the evidence of every entry. NEVER invent new
+     entities, teams, people, or relationships that are absent from the report. If no report was
+     fetched, leave blast_radius empty.
+   - Which teams are impacted: map affected_components to team_context owned_components and
+     blast radius team entries when available.
    - For each team, decide impact_type: awareness (needs information), action (must perform work), approval (must approve before external/sensitive action), none (should not be notified). Base this on team ownership and nature of change (e.g., mobile team needs action if API contract changed).
-   - Downstream workflows affected: processes relying on changed behavior, derived from work_scope.planned_tasks and dependencies.
+   - Downstream workflows affected: processes relying on changed behavior, derived from work_scope.planned_tasks, dependencies, and blast radius downstream_workflows.
    - Risks: potential downstream failures or required follow-up.
    - Evidence for every inference: each stakeholder, workflow, and risk must cite file_change, dependency, or project_context evidence.
    - confidence: 0-1 reflecting grounding strength.
 
 Rules:
 - Every stakeholder, workflow, and risk inference must include evidence.
-- Ground all inferences in ProjectContext (architecture, team_context, stakeholders, work_scope) and EnrichedChangeRecord (changed_files, patches, functions, summary, behavior_before/after).
-- Do not invent teams or components not present in context.
+- Ground all inferences in ProjectContext, EnrichedChangeRecord (changed_files, patches, functions, summary, behavior_before/after), and the BlastRadiusReport when available.
+- Do not invent teams, components, people, or dependencies not present in the evidence.
 - After generating the ImpactReport, you MUST call save_impact_report with project_id and the complete report, then return the same JSON as final output.
 
 Return ONLY the ImpactReport JSON matching the output_schema.
@@ -108,6 +128,7 @@ class ImpactAnalysisAgent:
         self._firestore: Any = None
         self._current_project_id: str = ""
         self._current_commit_sha: str = ""
+        self._current_pr_number: int = 0
         self.saved_document_path: Optional[str] = None
         self.saved_by_tool: bool = False
 
@@ -120,8 +141,10 @@ class ImpactAnalysisAgent:
             tools=[
                 self._get_project_context_tool,
                 self._get_enriched_change_tool,
+                self._get_blast_radius_tool,
                 self._save_impact_report_tool,
             ],
+            before_tool_callback=make_before_tool_guard(AgentIdentity.IMPACT_ANALYSIS_AGENT),
         )
 
     def _get_project_context_tool(self, project_id: str) -> dict:
@@ -165,6 +188,34 @@ class ImpactAnalysisAgent:
             logger.exception("Failed to fetch EnrichedChange for %s %s", project_id, commit_sha)
             return {"status": "error", "error": str(exc)}
 
+    def _get_blast_radius_tool(self, project_id: str, pr_number: int) -> dict:
+        """Read-only access to the deterministic BlastRadiusReport for the PR.
+
+        The Impact Agent gets the generated evidence/graph — never sandbox or
+        repository execution permissions.
+        """
+        try:
+            client = self.firestore_client
+            doc = (
+                client.collection("projects")
+                .document(project_id)
+                .collection("blast_radius")
+                .document(str(pr_number))
+                .get()
+            )
+            if not doc.exists:
+                logger.warning(
+                    "BlastRadiusReport not found for project_id=%s pr_number=%s", project_id, pr_number
+                )
+                return {
+                    "status": "error",
+                    "error": f"BlastRadiusReport not found for project_id={project_id} pr_number={pr_number}",
+                }
+            return {"status": "success", "blast_radius_report": doc.to_dict() or {}}
+        except Exception as exc:
+            logger.exception("Failed to fetch BlastRadiusReport for %s/%s", project_id, pr_number)
+            return {"status": "error", "error": str(exc)}
+
     def _save_impact_report_tool(self, project_id: str, impact_report: dict[str, Any]) -> dict:
         """Save the ImpactReport to Firestore under projects/{project_id}/impact_reports/{commit_sha}."""
         try:
@@ -194,7 +245,7 @@ class ImpactAnalysisAgent:
             return {"status": "error", "error": str(exc)}
 
     def analyze(
-        self, project_id: str, commit_sha: str
+        self, project_id: str, commit_sha: str, pr_number: Optional[int] = None
     ) -> tuple[ImpactReport, str, bool]:
         if not project_id or not project_id.strip():
             raise ValueError("project_id cannot be empty")
@@ -203,10 +254,13 @@ class ImpactAnalysisAgent:
 
         self._current_project_id = project_id
         self._current_commit_sha = commit_sha
+        self._current_pr_number = pr_number or 0
         self.saved_document_path = None
         self.saved_by_tool = False
 
         payload = {"project_id": project_id, "commit_sha": commit_sha}
+        if pr_number:
+            payload["pr_number"] = pr_number
         events = asyncio.run(self._run_agent(payload))
         report = self._extract_report(events)
 
@@ -310,3 +364,5 @@ class ImpactAnalysisAgent:
         path = f"projects/{project_id}/impact_reports/{report.commit_sha}"
         logger.info("Saved impact report %s", path)
         return path
+
+

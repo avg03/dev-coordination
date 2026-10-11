@@ -16,6 +16,8 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from github_infrastructure.config import settings
+from security.guard import make_before_tool_guard
+from security.identities import AgentIdentity
 
 try:
     from agents.coordination_agent import CoordinationPlan
@@ -105,7 +107,6 @@ class CommunicationAgent:
         self._firestore: Any = None
         self._current_project_id: str = ""
         self._current_commit_sha: str = ""
-        self._sent_messages: list[dict[str, Any]] = []
 
     def _build_agent(self) -> Agent:
         return Agent(
@@ -114,6 +115,7 @@ class CommunicationAgent:
             instruction=COMMUNICATION_INSTRUCTION,
             output_schema=CommunicationResult,
             tools=[self._get_project_context_tool, self._get_coordination_plan_tool],
+            before_tool_callback=make_before_tool_guard(AgentIdentity.COMMUNICATION_AGENT),
         )
 
     def _get_project_context_tool(self, project_id: str) -> dict:
@@ -164,6 +166,11 @@ class CommunicationAgent:
     def analyze(
         self, project_id: str, commit_sha: str, dry_run: bool = True
     ) -> CommunicationResult:
+        """Pure reasoning/drafting: generate and persist drafts. NEVER sends Slack.
+
+        Delivery happens only via the human approval endpoint, the
+        PermissionGateway and the SlackExecutor (see security/execution.py).
+        """
         if not project_id or not project_id.strip():
             raise ValueError("project_id cannot be empty")
         if not commit_sha or not commit_sha.strip():
@@ -171,16 +178,13 @@ class CommunicationAgent:
 
         self._current_project_id = project_id
         self._current_commit_sha = commit_sha
-        self._sent_messages = []
 
         payload = {"project_id": project_id, "commit_sha": commit_sha}
         events = asyncio.run(self._run_agent(payload))
         result = self._extract_result(events)
         result.project_id = project_id
         result.commit_sha = commit_sha
-
-        sent = self._mock_send_all(result.messages)
-        result.total_sent = sent
+        # No sends here — total_sent stays 0 until the approval endpoint delivers.
         return result
 
     async def _run_agent(self, payload: dict[str, Any]) -> list[Event]:
@@ -251,66 +255,6 @@ class CommunicationAgent:
             self._firestore = firestore.Client(**kwargs)
         return self._firestore
 
-    def _mock_send_all(self, messages: list[SlackMessage]) -> int:
-        count = 0
-        for msg in messages:
-            self._send_slack(msg.channel, msg.text, msg.mode, msg.recipient, msg.team)
-            count += 1
-        return count
-
-    def _send_slack(
-        self, channel: str, text: str, mode: str, recipient: str, team: str
-    ) -> dict:
-        """Send via Slack API with mock fallback. Uses services.slack_service if token present."""
-        try:
-            from services.slack_service import send_slack_message
-        except ImportError:
-            try:
-                from backend.services.slack_service import send_slack_message
-            except ImportError:
-                send_slack_message = None  # type: ignore
-
-        if send_slack_message:
-            result = send_slack_message(channel=channel, text=text)
-            entry = {
-                "channel": channel or "(no-channel)",
-                "recipient": recipient,
-                "team": team,
-                "mode": mode,
-                "text_preview": text[:120].replace("\n", " ") + ("..." if len(text) > 120 else ""),
-                "status": result.get("status", "mock_sent"),
-                "slack_ts": result.get("ts"),
-            }
-            self._sent_messages.append(entry)
-            if result.get("status") == "sent":
-                logger.info("[SLACK] %s -> %s (%s): %s", team, channel, mode, entry["text_preview"])
-            else:
-                logger.info("[MOCK SLACK] %s -> %s (%s): %s", team, channel or recipient, mode, entry["text_preview"])
-            return result
-
-        # Fallback mock if service not importable
-        entry = {
-            "channel": channel or "(no-channel)",
-            "recipient": recipient,
-            "team": team,
-            "mode": mode,
-            "text_preview": text[:120].replace("\n", " ") + ("..." if len(text) > 120 else ""),
-            "status": "mock_sent",
-        }
-        self._sent_messages.append(entry)
-        logger.info(
-            "[MOCK SLACK] %s -> %s (%s): %s",
-            team,
-            channel or recipient,
-            mode,
-            entry["text_preview"],
-        )
-        return {"status": "mock_sent", "channel": channel, "ok": True}
-
-    # Kept for backward compat
-    def _mock_send_slack(self, channel: str, text: str, mode: str, recipient: str, team: str) -> dict:
-        return self._send_slack(channel, text, mode, recipient, team)
-
     def persist_communication(
         self, project_id: str, commit_sha: str, result: CommunicationResult
     ) -> str:
@@ -328,3 +272,5 @@ class CommunicationAgent:
         path = f"projects/{project_id}/communications/{commit_sha}"
         logger.info("Saved communication result %s", path)
         return path
+
+

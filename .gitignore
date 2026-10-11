@@ -2,6 +2,7 @@
 
 venv/
 .venv/
+.venv2/
 env/
 .env/
 .env
@@ -10,3 +11,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 change_record_f20bca75.json
+
+# ZCode workspace tooling
+.zcode/
+
+# Blast radius sandbox workspaces (defensive — they live in system temp)
+blast-radius-*/
