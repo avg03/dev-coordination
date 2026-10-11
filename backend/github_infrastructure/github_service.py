@@ -62,3 +62,30 @@ class GitHubService:
         resp = httpx.get(url, headers=headers, params={"per_page": 100}, timeout=self.timeout)
         resp.raise_for_status()
         return [item["sha"] for item in resp.json() if item.get("sha")]
+
+    async def fetch_pr_files(self, owner: str, repository: str, pr_number: int) -> List[dict]:
+        """PR files with status/additions/deletions/patch (paginated)."""
+        import asyncio
+
+        def _sync_fetch() -> List[dict]:
+            url = f"{GITHUB_API_BASE}/repos/{owner}/{repository}/pulls/{pr_number}/files"
+            headers = self._headers()
+            params = {"per_page": 100}
+            files: List[dict] = []
+            while url:
+                resp = httpx.get(url, headers=headers, params=params, timeout=self.timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                files.extend(item for item in data if isinstance(item, dict))
+                link = resp.headers.get("Link", "")
+                next_url = None
+                if 'rel="next"' in link:
+                    for part in link.split(","):
+                        if 'rel="next"' in part:
+                            next_url = part.split(";")[0].strip().strip("<>").strip()
+                            break
+                url = next_url
+                params = {}
+            return files
+
+        return await asyncio.to_thread(_sync_fetch)

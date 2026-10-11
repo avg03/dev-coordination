@@ -21,20 +21,26 @@ except ImportError:
 
 
 class PRWorker:
-    """Pub/Sub consumer for `pr-events-sub` that triggers PRWorkflow.run()."""
+    """Pub/Sub consumer that triggers PRWorkflow.run() — shares webhook topic with CommitWorker (auto)."""
 
     def __init__(
         self,
         project: Optional[str] = None,
-        subscription_id: str = "pr-events-sub",
-        topic_id: str = "pr-events",
+        subscription_id: Optional[str] = None,
+        topic_id: Optional[str] = None,
         workflow: Optional[PRWorkflow] = None,
     ) -> None:
         self.project = project or settings.gcp_project
         if not self.project:
             raise ValueError("GCP project is not configured")
-        self.subscription_id = subscription_id or os.getenv("PR_EVENTS_SUBSCRIPTION", "pr-events-sub")
-        self.topic_id = topic_id or os.getenv("PR_EVENTS_TOPIC", "pr-events")
+        # Share the webhook topic (github-webhook-events) so PR pull_request events published by /github/webhook are delivered.
+        # Keep a distinct subscription so CommitWorker (push) and PRWorker (pull_request) each get a copy.
+        default_topic = settings.pubsub_topic  # github-webhook-events from .env
+        default_sub = f"{default_topic}-pr-sub"  # e.g. github-webhook-events-pr-sub
+        self.subscription_id = (
+            subscription_id or os.getenv("PR_EVENTS_SUBSCRIPTION") or os.getenv("GITHUB_EVENTS_SUBSCRIPTION_PR") or default_sub
+        )
+        self.topic_id = topic_id or os.getenv("PR_EVENTS_TOPIC") or default_topic
         self.workflow = workflow  # injected for testing; created lazily otherwise
         self._subscriber: Optional[pubsub_v1.SubscriberClient] = None
         self._publisher: Optional[pubsub_v1.PublisherClient] = None
@@ -96,6 +102,26 @@ class PRWorker:
             raise ValueError("Message JSON must be an object")
         return payload
 
+    def _resolve_project_id(self, repo_full: str) -> str:
+        """One-repo test: webhook never sends project_id. Resolve to the actual project_contexts/{id} (e.g. authentication-redesign) so PRWorkflow finds enriched_changes."""
+        try:
+            # Reuse same Firestore DB as pipeline: dev-coordination
+            from github_infrastructure.firestore_service import get_change_store
+
+            client = get_change_store().client
+            docs = list(client.collection("project_contexts").stream())
+            if docs:
+                # Prefer exact repo match if stored, else first project (covers campuscart vs authentication-redesign mismatch)
+                for d in docs:
+                    data = d.to_dict() or {}
+                    # If project stores repo in any field, would match here; fallback to first
+                    if repo_full and repo_full in str(data):
+                        return d.id
+                return docs[0].id
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Could not resolve project_id for repo %s: %s", repo_full, exc)
+        return repo_full  # last resort — will raise ValueError in PRWorkflow if no such project_context
+
     def _extract_pr_event_dict(self, payload: dict[str, Any]) -> dict[str, Any]:
         # Direct PREvent shape: {project_id, owner, repository, pr_number, action}
         if {"project_id", "owner", "repository", "pr_number"}.issubset(payload.keys()):
@@ -131,9 +157,14 @@ class PRWorker:
                 repository = repo_obj.get("name", "")
 
         project_id = payload.get("project_id") or metadata.get("project_id") or payload.get("projectId") or ""
-        # If project_id missing, fall back to repo full name as project identifier
-        if not project_id and repo_full:
-            project_id = repo_full
+        # Webhook never sends project_id — resolve to the real project_context id (one-repo test: first/only doc)
+        if not project_id:
+            resolved = self._resolve_project_id(repo_full) if repo_full else ""
+            project_id = resolved or (repo_full if repo_full else "")
+
+        head_sha = str(metadata.get("sha") or "") or str(
+            (raw_payload.get("pull_request") or {}).get("head", {}).get("sha", "") or ""
+        )
 
         candidate = {
             "project_id": project_id,
@@ -141,6 +172,7 @@ class PRWorker:
             "repository": repository,
             "pr_number": pr_number,
             "action": action,
+            "head_sha": head_sha,
         }
         # Only return if we have the required fields to validate
         if candidate["project_id"] and candidate["owner"] and candidate["repository"] and candidate["pr_number"] is not None:
@@ -175,7 +207,7 @@ class PRWorker:
         return pr_event
 
     def run_once(self, max_messages: int = 10, timeout: float = 30.0) -> int:
-        """Pull-based processing for testing and cron. Acks only on success."""
+        """Pull-based processing for testing and cron. Acks only on success. Skips non-PR events (push) cleanly."""
         self.ensure_subscription()
         response = self.subscriber.pull(
             subscription=self.subscription_path,
@@ -186,6 +218,12 @@ class PRWorker:
         ack_ids: list[str] = []
         for received in response.received_messages:
             try:
+                attrs = dict(received.message.attributes or {})
+                # Same topic as CommitWorker — filter to pull_request only, skip push without poisoning PR subscription
+                if attrs.get("event") and attrs.get("event") != "pull_request":
+                    logger.info("Skipping non-PR event '%s' on PR subscription", attrs.get("event"))
+                    ack_ids.append(received.ack_id)
+                    continue
                 # Decode, validate, and trigger workflow
                 raw = self._decode_message(received.message.data)
                 pr_dict = self._extract_pr_event_dict(raw)
@@ -212,6 +250,15 @@ class PRWorker:
                     pr_event.repository,
                 )
             except Exception as exc:
+                err_str = str(exc).lower()
+                if "resource_exhausted" in err_str or "429" in err_str or "quota" in err_str:
+                    logger.warning(
+                        "PR %s quota exhausted (429) — acking to avoid infinite loop: %s",
+                        pr_event.pr_number if 'pr_event' in locals() else "?",
+                        exc,
+                    )
+                    ack_ids.append(received.ack_id)
+                    continue
                 logger.exception(
                     "Failed to process PR message %s; NOT acking for redelivery: %s",
                     received.message.message_id,
@@ -231,12 +278,17 @@ class PRWorker:
         return len(ack_ids)
 
     def start(self) -> None:
-        """Streaming pull - for production use. Ack only after workflow success."""
+        """Streaming pull - for production use. Ack only after workflow success. Skips push."""
 
         self.ensure_subscription()
 
         def _callback(message: pubsub_v1.subscriber.message.Message) -> None:
             try:
+                attrs = dict(message.attributes or {})
+                if attrs.get("event") and attrs.get("event") != "pull_request":
+                    logger.info("Skipping non-PR event '%s' on PR subscription", attrs.get("event"))
+                    message.ack()
+                    return
                 raw = self._decode_message(message.data)
                 pr_dict = self._extract_pr_event_dict(raw)
                 pr_event = self._validate_event(pr_dict)
@@ -260,6 +312,16 @@ class PRWorker:
                     pr_event.repository,
                 )
             except Exception as exc:
+                # 429 quota → ack to stop infinite redelivery loop (analysis already stored per user, avoid burning quota)
+                err_str = str(exc).lower()
+                if "resource_exhausted" in err_str or "429" in err_str or "quota" in err_str:
+                    logger.warning(
+                        "PR %s quota exhausted (429) — acking to avoid loop, will retry on next PR event: %s",
+                        pr_event.pr_number if 'pr_event' in locals() else "?",
+                        exc,
+                    )
+                    message.ack()
+                    return
                 logger.exception(
                     "Failed to process streaming PR message %s; nacking for redelivery: %s",
                     message.message_id,

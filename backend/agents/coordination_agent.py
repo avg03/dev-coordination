@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 
 from github_infrastructure.change_records import ChangeType, Evidence
 from github_infrastructure.config import settings
+from security.guard import make_before_tool_guard
+from security.identities import AgentIdentity
 
 try:
     from agents.impact_analysis_agent import ImpactReport
@@ -129,6 +131,7 @@ class CoordinationAgent:
                 self._get_project_context_tool,
                 self._save_coordination_plan_tool,
             ],
+            before_tool_callback=make_before_tool_guard(AgentIdentity.COORDINATION_AGENT),
         )
 
     def _get_impact_report_tool(self, project_id: str, commit_sha: str) -> dict:
@@ -303,3 +306,5 @@ class CoordinationAgent:
                 kwargs["database"] = self.database
             self._firestore = firestore.Client(**kwargs)
         return self._firestore
+
+

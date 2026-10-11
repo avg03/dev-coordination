@@ -53,6 +53,10 @@ class PRReviewResponse(BaseModel):
     communication_bundle: CommunicationBundle | CommunicationResult | None = Field(
         default=None, description="PR-level communication bundle"
     )
+    workflow: dict | None = Field(
+        default=None,
+        description="Readiness-gate workflow state (WAITING_FOR_COMMITS, READY, PROCESSING, COMPLETED, PARTIAL, FAILED) — lets the UI distinguish waiting/partial/failed from success",
+    )
 
 
 def get_context_agent() -> ContextAgent:
@@ -245,12 +249,34 @@ def get_pr_review(
             except Exception:
                 logger.warning("Invalid CommunicationBundle shape for %s/%s", project_id, pr_id)
 
+    # Readiness-gate workflow state (best-effort, additive — never breaks review).
+    workflow_state: dict | None = None
+    try:
+        from coordination.stores import FirestorePRWorkflowStore
+        from github_infrastructure.config import settings as _settings
+
+        if _settings.gcp_project:
+            _prs = FirestorePRWorkflowStore(project=_settings.gcp_project)
+            _head = ""
+            if isinstance(comm_data, dict):
+                _head = str(comm_data.get("head_sha", "") or "")
+            if _head:
+                _rec = _prs.get(project_id, pr_number, _head)
+            else:
+                _candidates = _prs.list_for_pr(project_id, pr_number)
+                _rec = max(_candidates, key=lambda r: r.updated_at) if _candidates else None
+            if _rec is not None:
+                workflow_state = _rec.model_dump(mode="json")
+    except Exception:
+        logger.warning("PR workflow state lookup failed for %s/%s", project_id, pr_id)
+
     return PRReviewResponse(
         project_id=project_id,
         pr_number=pr_number,
         impact_report=impact_report,
         coordination_plan=coordination_plan,
         communication_bundle=communication_bundle,
+        workflow=workflow_state,
     )
 
 
@@ -355,32 +381,61 @@ def approve_pr(
             detail=f"Invalid message ids: {invalid}. Available: {sorted(id_to_msg.keys())}",
         )
 
-    # Send via SlackService
+    # Approval binding + authorization + idempotent execution.
+    # The approve endpoint is the authoritative human approval; the gateway
+    # then authorizes each send and the SlackExecutor guarantees exactly-once
+    # delivery (retries return the stored result, never a duplicate message).
+    from security.approval import ApprovalValidationError, build_approval, validate_approval_for_message
+    from security.execution import get_slack_executor, new_approval_id
+
+    approval_id = new_approval_id()
+    approval = build_approval(
+        approval_id=approval_id,
+        project_id=project_id,
+        pr_number=pr_number,
+        approved=True,
+        approved_at=now_iso,
+        selected_message_ids=target_ids,
+    )
+
+    executor = get_slack_executor()
     sent_results: list[dict] = []
-    try:
-        from services.slack_service import send_slack_message
-    except ImportError:
-        try:
-            from backend.services.slack_service import send_slack_message  # type: ignore
-        except ImportError:
-            send_slack_message = None  # type: ignore
+    denied_any = False
 
     for mid in target_ids:
         msg = id_to_msg[mid]
         channel = msg.get("channel") or ""
-        text = msg.get("text") or ""
-        if send_slack_message:
-            result = send_slack_message(channel=channel, text=text)
-        else:
-            logger.info("[MOCK SLACK] %s -> %s: %s", msg.get("team"), channel, text[:80])
-            result = {"status": "mock_sent", "channel": channel, "ok": True, "mock": True}
-        sent_results.append({"id": mid, "channel": channel, "result": result})
+        try:
+            validate_approval_for_message(approval, project_id, str(pr_number), mid, msg)
+        except ApprovalValidationError as exc:
+            logger.warning("Approval binding rejected message %s: %s", mid, exc)
+            sent_results.append(
+                {"id": mid, "channel": channel, "result": {"status": "denied", "ok": False, "error": str(exc)}}
+            )
+            denied_any = True
+            continue
+        delivery = executor.execute_send(project_id, pr_number, msg, approval_id)
+        sent_results.append(
+            {
+                "id": mid,
+                "channel": delivery.channel or channel,
+                "result": {
+                    "status": delivery.status,
+                    "ok": delivery.ok,
+                    "error": delivery.reason or None,
+                    "ts": delivery.slack_ts,
+                    "reused": delivery.reused,
+                },
+            }
+        )
+        if delivery.status in ("denied", "in_progress"):
+            denied_any = True
 
     # Determine overall delivery status
     has_real = any(r["result"].get("status") == "sent" for r in sent_results)
     has_mock = any(r["result"].get("status") == "mock_sent" for r in sent_results)
     has_error = any(not r["result"].get("ok") for r in sent_results)
-    if has_error:
+    if denied_any or has_error:
         delivery_status = "failed"
     elif has_real and not has_mock:
         delivery_status = "sent"
