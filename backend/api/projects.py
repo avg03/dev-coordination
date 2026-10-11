@@ -53,6 +53,10 @@ class PRReviewResponse(BaseModel):
     communication_bundle: CommunicationBundle | CommunicationResult | None = Field(
         default=None, description="PR-level communication bundle"
     )
+    workflow: dict | None = Field(
+        default=None,
+        description="Readiness-gate workflow state (WAITING_FOR_COMMITS, READY, PROCESSING, COMPLETED, PARTIAL, FAILED) — lets the UI distinguish waiting/partial/failed from success",
+    )
 
 
 def get_context_agent() -> ContextAgent:
@@ -245,12 +249,34 @@ def get_pr_review(
             except Exception:
                 logger.warning("Invalid CommunicationBundle shape for %s/%s", project_id, pr_id)
 
+    # Readiness-gate workflow state (best-effort, additive — never breaks review).
+    workflow_state: dict | None = None
+    try:
+        from coordination.stores import FirestorePRWorkflowStore
+        from github_infrastructure.config import settings as _settings
+
+        if _settings.gcp_project:
+            _prs = FirestorePRWorkflowStore(project=_settings.gcp_project)
+            _head = ""
+            if isinstance(comm_data, dict):
+                _head = str(comm_data.get("head_sha", "") or "")
+            if _head:
+                _rec = _prs.get(project_id, pr_number, _head)
+            else:
+                _candidates = _prs.list_for_pr(project_id, pr_number)
+                _rec = max(_candidates, key=lambda r: r.updated_at) if _candidates else None
+            if _rec is not None:
+                workflow_state = _rec.model_dump(mode="json")
+    except Exception:
+        logger.warning("PR workflow state lookup failed for %s/%s", project_id, pr_id)
+
     return PRReviewResponse(
         project_id=project_id,
         pr_number=pr_number,
         impact_report=impact_report,
         coordination_plan=coordination_plan,
         communication_bundle=communication_bundle,
+        workflow=workflow_state,
     )
 
 

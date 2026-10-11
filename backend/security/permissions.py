@@ -67,6 +67,26 @@ PERMISSION_MATRIX: dict[str, set[tuple[Action, Resource]]] = {
         (Action.EXECUTE, Resource.STATIC_ANALYSIS),
         (Action.WRITE, Resource.BLAST_RADIUS),
     },
+    # Commit readiness gate: deterministic pipeline services (not LLM agents).
+    # CommitWorker tracks per-commit status and publishes completion events.
+    AgentIdentity.COMMIT_WORKER.value: {
+        (Action.READ, Resource.CHANGE_RECORDS),
+        (Action.WRITE, Resource.CHANGE_RECORDS),
+        (Action.READ, Resource.ENRICHED_CHANGES),
+        (Action.WRITE, Resource.ENRICHED_CHANGES),
+        (Action.READ, Resource.PROJECT_CONTEXT),
+        (Action.READ, Resource.COMMIT_STATUS),
+        (Action.WRITE, Resource.COMMIT_STATUS),
+        (Action.EXECUTE, Resource.COMPLETION_EVENTS),
+    },
+    # Completion consumer: inspect statuses + schedule PR processing only.
+    # No Slack, no agent execution, no external side effects.
+    AgentIdentity.COMPLETION_CONSUMER.value: {
+        (Action.READ, Resource.COMMIT_STATUS),
+        (Action.READ, Resource.ENRICHED_CHANGES),
+        (Action.READ, Resource.PR_WORKFLOWS),
+        (Action.WRITE, Resource.PR_WORKFLOWS),
+    },
 }
 
 # Actions considered external side effects — always policy-gated.

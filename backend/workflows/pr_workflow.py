@@ -65,6 +65,9 @@ class PRWorkflow:
         blast_radius_service: Optional[Any] = None,
         project: Optional[str] = None,
         database: Optional[str] = None,
+        pr_store: Optional[Any] = None,
+        commit_status_store: Optional[Any] = None,
+        enriched_exists_fn: Optional[Any] = None,
     ) -> None:
         from github_infrastructure.config import settings
 
@@ -79,6 +82,10 @@ class PRWorkflow:
         self.blast_radius_service = blast_radius_service
         self._idempotency = idempotency_manager
         self._firestore = None
+        # Readiness-gate stores (injectable for tests; Firestore otherwise).
+        self._pr_store = pr_store
+        self._commit_status_store = commit_status_store
+        self._enriched_exists_fn = enriched_exists_fn
 
     @property
     def firestore_client(self):
@@ -128,6 +135,304 @@ class PRWorkflow:
             self._idempotency = get_idempotency_manager()
         return self._idempotency
 
+    # -- readiness gate stores --------------------------------------------
+
+    def _get_pr_store(self) -> Optional[Any]:
+        if self._pr_store is not None:
+            return self._pr_store
+        try:
+            from coordination.stores import FirestorePRWorkflowStore
+
+            self._pr_store = FirestorePRWorkflowStore(project=self.project, database=self.database)
+            return self._pr_store
+        except Exception:
+            logger.warning("PR workflow store unavailable — gate will fail open to legacy behavior")
+            return None
+
+    def _get_commit_status_store(self) -> Optional[Any]:
+        if self._commit_status_store is not None:
+            return self._commit_status_store
+        try:
+            from coordination.stores import FirestoreCommitStatusStore
+
+            self._commit_status_store = FirestoreCommitStatusStore(project=self.project, database=self.database)
+            return self._commit_status_store
+        except Exception:
+            return None
+
+    def _enriched_exists(self, project_id: str, sha: str) -> bool:
+        if self._enriched_exists_fn is not None:
+            try:
+                return bool(self._enriched_exists_fn(project_id, sha))
+            except Exception:
+                return False
+        try:
+            from github_infrastructure.pipeline import enriched_exists
+
+            return enriched_exists(project_id, sha)
+        except Exception:
+            # Fallback: direct Firestore read (same semantics as pipeline helper).
+            try:
+                doc = (
+                    self.firestore_client.collection("projects")
+                    .document(project_id)
+                    .collection("enriched_changes")
+                    .document(sha)
+                    .get()
+                )
+                return bool(doc.exists)
+            except Exception:
+                return False
+
+    async def _gate_check(self, pr_event: PREvent, workflow_id: str, commits: List[str]) -> dict[str, Any]:
+        """Persist WAITING_FOR_COMMITS before checking (race-safe), recheck
+        after registration, enforce timeout/fallback. Never runs PR agents."""
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+
+        from coordination.config import pr_wait_timeout_seconds
+
+        pr_store = await asyncio.to_thread(self._get_pr_store)
+        status_store = await asyncio.to_thread(self._get_commit_status_store)
+        repo_full = f"{pr_event.owner}/{pr_event.repository}" if pr_event.owner else pr_event.repository
+
+        # Gate unavailable (no Firestore in some test contexts) — legacy pass-through.
+        if pr_store is None or status_store is None:
+            return {"decision": "proceed"}
+
+        def _sync_gate() -> dict[str, Any]:
+            from coordination.gate import check_readiness
+            from coordination.models import PRWorkflowRecord
+
+            timeout = pr_wait_timeout_seconds()
+            now = datetime.now(timezone.utc)
+            # 1. Load or create state for THIS revision (doc id includes head SHA).
+            state = pr_store.get(pr_event.project_id, pr_event.pr_number, pr_event.head_sha or "")
+            if state is None:
+                state = PRWorkflowRecord(
+                    project_id=pr_event.project_id,
+                    owner=pr_event.owner,
+                    repository=pr_event.repository,
+                    pr_number=pr_event.pr_number,
+                    head_sha=pr_event.head_sha or "",
+                    action=pr_event.action,
+                    required_shas=list(commits),
+                    status="PENDING",
+                    wait_started_at=now.isoformat(),
+                    deadline_at=(now + timedelta(seconds=timeout)).isoformat(),
+                )
+            else:
+                # Revision change is a new doc; same-doc required-set refresh.
+                state.required_shas = list(commits)
+                state.action = pr_event.action
+            # 2. Supersede stale WAITING docs for the same PR number / other heads.
+            try:
+                for other in pr_store.list_for_pr(pr_event.project_id, pr_event.pr_number):
+                    if other.head_sha != (pr_event.head_sha or "") and other.status in ("PENDING", "WAITING_FOR_COMMITS", "READY", "PROCESSING"):
+                        other.status = "SUPERSEDED"
+                        other.error = f"superseded by head {(pr_event.head_sha or '')[:8]}"
+                        pr_store.put(other)
+            except Exception:
+                logger.exception("Gate: supersede check failed for PR#%s", pr_event.pr_number)
+            # 3. Persist WAITING state BEFORE the authoritative check (race-safe:
+            # a commit finishing right now will find this record).
+            if state.status in ("PENDING", "READY", "PROCESSING", "COMPLETED", "PARTIAL", "FAILED", "SUPERSEDED") and state.status not in ("PENDING",):
+                pass  # terminal/processing states are left intact except required-set refresh above
+            else:
+                state.status = "WAITING_FOR_COMMITS"
+            if not state.wait_started_at:
+                state.wait_started_at = now.isoformat()
+            if not state.deadline_at:
+                state.deadline_at = (now + timedelta(seconds=timeout)).isoformat()
+            pr_store.put(state)
+            # 4. Authoritative recheck AFTER registration (closes lost-event race).
+            ready, missing, failed = check_readiness(
+                status_store, self._enriched_exists,
+                project_id=pr_event.project_id, repository=repo_full, required_shas=list(commits),
+            )
+            if ready:
+                state.status = "READY"
+                state.missing_shas = []
+                state.failed_shas = []
+                pr_store.put(state)
+                self._audit_gate(pr_event, workflow_id, "READY", f"{len(commits)} commits ready")
+                return {"decision": "proceed", "state": state.model_dump(mode="json")}
+            # 5. Timeout path: rechecked already; partial when meaningful else FAILED.
+            try:
+                deadline = datetime.fromisoformat(str(state.deadline_at)) if state.deadline_at else None
+            except ValueError:
+                deadline = None
+            if deadline is not None and now >= deadline:
+                from coordination.gate import can_produce_partial
+
+                available = len(commits) - len(missing)
+                if can_produce_partial(available, len(commits)):
+                    state.status = "READY"
+                    state.partial = True
+                    state.missing_shas = list(missing)
+                    state.failed_shas = list(failed)
+                    state.error = f"wait timeout with {available}/{len(commits)} commits; partial analysis"
+                    pr_store.put(state)
+                    self._audit_gate(pr_event, workflow_id, "READY", "timeout partial")
+                    return {"decision": "proceed", "partial": True, "state": state.model_dump(mode="json")}
+                state.status = "FAILED"
+                state.missing_shas = list(missing)
+                state.failed_shas = list(failed)
+                state.error = f"wait timeout: missing=[{','.join(s[:8] for s in missing[:5])}]"
+                pr_store.put(state)
+                self._audit_gate(pr_event, workflow_id, "FAILED", state.error)
+                return {"decision": "failed", "missing": missing, "failed_shas": failed}
+            # 6. Still waiting — record missing set, return without running agents.
+            state.status = "WAITING_FOR_COMMITS"
+            state.missing_shas = list(missing)
+            state.failed_shas = list(failed)
+            pr_store.put(state)
+            self._audit_gate(pr_event, workflow_id, "WAITING_FOR_COMMITS", f"missing={len(missing)}")
+            return {"decision": "wait", "missing": missing, "failed_shas": failed}
+
+        return await asyncio.to_thread(_sync_gate)
+
+    def _audit_gate(self, pr_event: PREvent, workflow_id: str, decision: str, reason: str) -> None:
+        try:
+            from security.audit import AuditEvent, AuditLogger
+
+            AuditLogger().record(
+                AuditEvent(
+                    agent_id="completion_consumer",
+                    action="write",
+                    resource="pr_workflows",
+                    project_id=pr_event.project_id,
+                    workflow_id=workflow_id,
+                    decision=decision,
+                    reason=reason[:500],
+                    policy="pr_readiness_gate",
+                    event_type="pr.workflow.transition",
+                )
+            )
+        except Exception:
+            pass
+
+    def _waiting_bundle(self, pr_event: PREvent, gate: dict[str, Any]) -> CommunicationBundle:
+        missing = gate.get("missing") or []
+        return CommunicationBundle(
+            project_id=pr_event.project_id,
+            pr_number=pr_event.pr_number,
+            owner=pr_event.owner,
+            repository=pr_event.repository,
+            messages=[],
+            summary=(
+                f"PR #{pr_event.pr_number} waiting for {len(missing)} commit(s) "
+                f"({','.join(s[:8] for s in missing[:5])}). Status=WAITING_FOR_COMMITS."
+            ),
+        )
+
+    def _failed_bundle(self, pr_event: PREvent, gate: dict[str, Any]) -> CommunicationBundle:
+        missing = gate.get("missing") or []
+        return CommunicationBundle(
+            project_id=pr_event.project_id,
+            pr_number=pr_event.pr_number,
+            owner=pr_event.owner,
+            repository=pr_event.repository,
+            messages=[],
+            summary=(
+                f"PR #{pr_event.pr_number} failed readiness: missing=[{','.join(s[:8] for s in missing[:5])}]. "
+                "Status=FAILED."
+            ),
+        )
+
+    async def _claim_dispatch(self, pr_event: PREvent, workflow_id: str, commits: List[str]) -> str:
+        """Atomically claim PR execution. Returns EXECUTE|COMPLETED|IN_PROGRESS."""
+        import asyncio
+
+        from coordination.config import pr_dispatch_step_name
+
+        idem = self._get_idempotency_manager()
+        fingerprint = {"head_sha": pr_event.head_sha, "commit_shas": sorted(commits)}
+        key = idem.build_key(pr_event.project_id, workflow_id, pr_dispatch_step_name(), fingerprint)
+        outcome = await asyncio.to_thread(
+            idem.claim, key,
+            workflow_id=workflow_id, project_id=pr_event.project_id,
+            step_name=pr_dispatch_step_name(), input_payload=fingerprint,
+        )
+        if outcome.status == ClaimStatus.COMPLETED:
+            return "completed"
+        if outcome.status == ClaimStatus.IN_PROGRESS:
+            return "in_progress"
+        # Mark state PROCESSING under the same claim (crash recovers via lease).
+        await self._mark_state_processing(pr_event)
+        return "execute"
+
+    async def _mark_state_processing(self, pr_event: PREvent) -> None:
+        import asyncio
+
+        def _sync() -> None:
+            store = self._get_pr_store()
+            if store is None:
+                return
+            state = store.get(pr_event.project_id, pr_event.pr_number, pr_event.head_sha or "")
+            if state is None:
+                return
+            state.status = "PROCESSING"
+            store.put(state)
+
+        await asyncio.to_thread(_sync)
+
+    async def _mark_state_terminal(self, pr_event: PREvent, status: str, partial: bool = False) -> None:
+        import asyncio
+
+        def _sync() -> None:
+            store = self._get_pr_store()
+            if store is None:
+                return
+            state = store.get(pr_event.project_id, pr_event.pr_number, pr_event.head_sha or "")
+            if state is None:
+                return
+            state.status = status  # type: ignore[assignment]
+            state.partial = partial
+            if status in ("COMPLETED", "PARTIAL"):
+                try:
+                    from security.idempotency import get_idempotency_manager
+
+                    from coordination.config import pr_dispatch_step_name
+
+                    # Close the dispatch claim so completion-event redeliveries
+                    # reuse instead of re-executing (crash-after-complete safe).
+                    idem = self._idempotency or get_idempotency_manager()
+                    commits = list(state.required_shas or [])
+                    fingerprint = {"head_sha": state.head_sha, "commit_shas": sorted(commits)}
+                    key = idem.build_key(state.project_id, state.workflow_id, pr_dispatch_step_name(), fingerprint)
+                    idem.complete(key, {"status": status, "pr_number": state.pr_number})
+                except Exception:
+                    pass
+            store.put(state)
+            self._audit_gate(pr_event, state.workflow_id, status, "terminal")
+
+        await asyncio.to_thread(_sync)
+
+    async def _mark_state_completed_if_exists(self, pr_event: PREvent) -> None:
+        import asyncio
+
+        def _sync() -> None:
+            store = self._get_pr_store()
+            if store is None:
+                return
+            state = store.get(pr_event.project_id, pr_event.pr_number, pr_event.head_sha or "")
+            if state is None or state.status in ("COMPLETED", "PARTIAL", "FAILED", "SUPERSEDED"):
+                return
+            state.status = "COMPLETED"
+            store.put(state)
+
+        await asyncio.to_thread(_sync)
+
+    def get_workflow_state(self, project_id: str, pr_number: int, head_sha: str) -> Optional[Any]:
+        store = self._get_pr_store()
+        if store is None:
+            return None
+        try:
+            return store.get(project_id, pr_number, head_sha or "")
+        except Exception:
+            return None
+
     async def _run_step(
         self,
         step_name: str,
@@ -175,11 +480,32 @@ class PRWorkflow:
         existing = await self._load_existing_bundle(pr_event)
         if existing is not None:
             logger.info("PR %s already has communications bundle for %s — skipping LLM re-run", pr_event.pr_number, pr_event.project_id)
+            await self._mark_state_completed_if_exists(pr_event)
             return existing
 
         workflow_id = f"pr:{pr_event.project_id}:{pr_event.pr_number}:{pr_event.head_sha or 'na'}"
         commits = await self._fetch_pr_commits(pr_event)
         project_context = await self._load_project_context(pr_event.project_id)
+
+        # --- Readiness gate: never run downstream PR agents until every
+        # required commit is COMPLETED with a durable EnrichedChangeRecord.
+        gate = await self._gate_check(pr_event, workflow_id, commits)
+        if gate["decision"] == "wait":
+            return self._waiting_bundle(pr_event, gate)
+        if gate["decision"] == "failed":
+            return self._failed_bundle(pr_event, gate)
+        partial = bool(gate.get("partial", False))
+
+        # Atomic dispatch claim: concurrent completion events must not launch
+        # the same PR workflow twice; crash-after-claim recovers via lease.
+        claimed = await self._claim_dispatch(pr_event, workflow_id, commits)
+        if claimed == "completed":
+            reloaded = await self._load_existing_bundle(pr_event)
+            if reloaded is not None:
+                return reloaded
+        elif claimed == "in_progress":
+            raise StepInProgressError(f"pr:dispatch is in progress for {workflow_id}")
+
         enriched_changes = await self._load_enriched_changes(pr_event.project_id, commits)
         pr_input = self._build_pr_analysis_input(project_context, enriched_changes, pr_event)
 
@@ -241,6 +567,7 @@ class PRWorkflow:
         )
 
         await self._persist_outputs(pr_event, impact_report, coordination_plan, communication_bundle)
+        await self._mark_state_terminal(pr_event, "PARTIAL" if partial else "COMPLETED", partial=partial)
 
         return communication_bundle
 
@@ -460,8 +787,36 @@ class PRWorkflow:
         pr_id = str(pr_event.pr_number)
 
         def _sync_persist() -> None:
-            # Persist under projects/{project_id}/<collection>/{pr_number} as per spec
+            # Stale-revision guard: never let an older head overwrite a newer
+            # revision's result. The gate keys state by head SHA; the bundle
+            # doc is keyed by PR number, so check before overwriting.
             base = self.firestore_client.collection("projects").document(pr_event.project_id)
+            try:
+                existing = base.collection("communications").document(pr_id).get()
+                if existing.exists:
+                    stored_head = str((existing.to_dict() or {}).get("head_sha", "") or "")
+                    if stored_head and pr_event.head_sha and stored_head != pr_event.head_sha:
+                        # Newer revision already processed (heads differ) — abort
+                        # rather than overwriting. The newer run owns this doc.
+                        logger.warning(
+                            "Stale persist blocked for PR#%s head %s (stored %s)",
+                            pr_event.pr_number, (pr_event.head_sha or "")[:8], stored_head[:8],
+                        )
+                        # Also mark our own state SUPERSEDED for observability.
+                        try:
+                            store = self._get_pr_store()
+                            if store is not None:
+                                mine = store.get(pr_event.project_id, pr_event.pr_number, pr_event.head_sha or "")
+                                if mine is not None and mine.status not in ("COMPLETED", "PARTIAL", "FAILED"):
+                                    mine.status = "SUPERSEDED"
+                                    mine.error = f"superseded by head {stored_head[:8]}"
+                                    store.put(mine)
+                        except Exception:
+                            pass
+                        return
+            except Exception:
+                logger.exception("Stale-guard read failed for PR#%s — proceeding", pr_event.pr_number)
+            # Persist under projects/{project_id}/<collection>/{pr_number} as per spec
             # ImpactReport
             impact_payload = impact_report.model_dump(mode="json")
             # Re-key to PR number for PR-level doc

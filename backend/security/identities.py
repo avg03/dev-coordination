@@ -20,6 +20,8 @@ class AgentIdentity(str, Enum):
     SUPERVISOR_AGENT = "supervisor_agent"
     SLACK_EXECUTOR = "slack_executor"
     BLAST_RADIUS_ANALYZER = "blast_radius_analyzer"
+    COMMIT_WORKER = "commit_worker"
+    COMPLETION_CONSUMER = "completion_consumer"
 
 
 class Action(str, Enum):
@@ -50,3 +52,6 @@ class Resource(str, Enum):
     SANDBOX_TEMP = "sandbox_temp"
     STATIC_ANALYSIS = "static_analysis"
     BLAST_RADIUS = "blast_radius"
+    COMMIT_STATUS = "commit_status"
+    PR_WORKFLOWS = "pr_workflows"
+    COMPLETION_EVENTS = "completion_events"
