@@ -16,6 +16,7 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from github_infrastructure.config import settings
+from llm import resolve_model
 from security.guard import make_before_tool_guard
 from security.identities import AgentIdentity
 
@@ -39,12 +40,23 @@ PROJECT_CONTEXTS_COLLECTION = "project_contexts"
 
 class SlackMessage(BaseModel):
     id: str = Field(default="", description="Stable message identifier, e.g., msg_1")
-    recipient: str = Field(description="Stakeholder name or team name")
+    recipient: str = Field(description="Stakeholder name (identity only — never a Slack ID)")
     team: str = Field(description="Team of the recipient")
-    channel: str = Field(description="Slack channel ID or user ID the message was sent to")
-    mode: Literal["group", "personal"] = Field(description="Whether sent to group channel or personal DM")
-    text: str = Field(description="Formatted Slack message body")
+    channel: str = Field(default="", description="Resolved by deterministic backend logic; leave empty")
+    mode: Literal["group", "personal"] = Field(default="group", description="Resolved by backend; all V1 messages go to one channel")
+    text: str = Field(description="Formatted Slack message body (no <@...> mentions — backend adds them)")
     evidence: list[str] = Field(default_factory=list, description="Evidence snippets included")
+    slack_user_id: str = Field(default="", description="Resolved by backend from the admin Slack mapping; never set by the agent")
+    unmapped: bool = Field(default=False, description="True when the backend found no Slack mapping for the recipient")
+    # Preference signals — populated deterministically by the backend from the
+    # CoordinationPlan task for the message's team (never invented by agents).
+    priority: str = Field(default="", description="Task priority: low|medium|high|critical")
+    impact_type: str = Field(default="", description="awareness|action|approval for the recipient's team")
+    action_required: bool = Field(default=False, description="True when the recipient must act")
+    component: str = Field(default="", description="Primary affected component for the recipient's team")
+    # Autonomy routing — stamped by the autonomy stage (policy + supervisor).
+    autonomy: str = Field(default="", description="AUTO_SEND|HUMAN_REVIEW|BLOCK|SKIP (empty = autonomy disabled)")
+    autonomy_reasons: list[str] = Field(default_factory=list, description="Why the autonomy decision was made")
 
 
 class CommunicationResult(BaseModel):
@@ -61,26 +73,29 @@ You are the Communication Agent. You turn a CoordinationPlan and ProjectContext 
 Workflow you MUST follow:
 1. Call get_project_context with project_id to fetch the ProjectContext (contains stakeholders with slack_user_id/slack_channel_id and team_context with slack_channel_id).
 2. Call get_coordination_plan with project_id and commit_sha to fetch the CoordinationPlan.
-3. For each member linked to the change:
-   - Link each CoordinationTask to its team members via ProjectContext.stakeholders (where stakeholder.team == task.team) and team_context (where team_context.name == task.team).
-   - Members with no slack_user_id are still notified via their team's slack_channel_id if mode is group/both.
-   - Frame a message that MUST include:
-     * what changed: task.component + task.change_type + plan.summary
-     * the changed component: task.component
-     * the evidence: task.evidence (source + detail) grounded from coordination plan
-     * the reason why this person is contacted: task.reason + task.impact_type + priority
-   - Personalize using stakeholder name, role, and team responsibilities.
-   - Choose channel: use stakeholder.slack_channel_id if present, else stakeholder.slack_user_id for personal mode, else team_context.slack_channel_id for group mode.
-   - Keep the tone concise and actionable. State whether action is required (task.action_required) and the confidence.
+3. For each AFFECTED PERSON linked to the change (one message per person, never per team):
+    - Link each CoordinationTask to its team members via ProjectContext.stakeholders (where stakeholder.team == task.team) and team_context (where team_context.name == task.team).
+    - Produce exactly one SlackMessage per affected person. If only one person is affected, produce exactly one message. Never duplicate a person.
+    - Set recipient to the person's stakeholder NAME and team to their TEAM. These are identity only.
+    - Do NOT invent Slack user/channel IDs. Do NOT write <@...> mentions. Do NOT set channel/slack_user_id (leave them empty — deterministic backend logic resolves them from the admin mapping and adds the single mention).
+    - Frame a message that MUST include:
+      * what changed: task.component + task.change_type + plan.summary
+      * the changed component: task.component
+      * the evidence: task.evidence (source + detail) grounded from coordination plan
+      * the reason why this person is contacted: task.reason + task.impact_type + priority
+      * the required action for this person (or explicitly state none).
+    - Personalize using stakeholder name, role, and team responsibilities.
+    - Leave channel empty and write no <@...> mentions: the backend resolves the admin-configured Slack user ID and single channel deterministically. Invented IDs are stripped.
+    - Keep the tone concise and actionable. State whether action is required (task.action_required) and the confidence.
 
 Rules:
 - Ground every message in ProjectContext and CoordinationPlan data. Do not invent.
 - Every message must cite evidence from the task.
-- Respect communication_preference: if stakeholder prefers group, use team channel; if personal, use DM; if both, prefer the task's mode.
-- Do not skip members that have a slack identifier and are linked to a task.
+- One message per affected person; never mention or duplicate additional users.
+- Do not skip members that are linked to a task, even when their Slack mapping is missing (the backend flags unmapped recipients for correction).
 - Assign each SlackMessage a stable id like msg_1, msg_2, etc., in order.
 
-Return ONLY the CommunicationResult JSON matching the output_schema, containing one SlackMessage per member linked to the change.
+Return ONLY the CommunicationResult JSON matching the output_schema, containing one SlackMessage per affected person.
 """
 
 
@@ -91,7 +106,9 @@ class CommunicationAgent:
         project: Optional[str] = None,
         database: Optional[str] = None,
     ) -> None:
-        self.model_name = model or DEFAULT_MODEL
+        self.model_name = model or resolve_model(
+            "COMMUNICATION_MODEL", "CONTEXT_AGENT_MODEL", default="gemini-3.5-flash"
+        )
         self.project = project or settings.gcp_project
         self.database = database or os.getenv("FIRESTORE_DATABASE", "(default)")
         if not self.project:
@@ -180,8 +197,18 @@ class CommunicationAgent:
         self._current_commit_sha = commit_sha
 
         payload = {"project_id": project_id, "commit_sha": commit_sha}
-        events = asyncio.run(self._run_agent(payload))
-        result = self._extract_result(events)
+        from telemetry.spans import track_agent_run
+
+        with track_agent_run("communication_agent", {"project_id": project_id}) as t:
+            events = asyncio.run(self._run_agent(payload))
+            t.set_usage_from_events(events)
+            result = self._extract_result(events)
+            t.set_outputs(
+                {
+                    "output.messages": len(getattr(result, "messages", None) or []),
+                    "output.summary": str(getattr(result, "summary", "") or ""),
+                }
+            )
         result.project_id = project_id
         result.commit_sha = commit_sha
         # No sends here — total_sent stays 0 until the approval endpoint delivers.

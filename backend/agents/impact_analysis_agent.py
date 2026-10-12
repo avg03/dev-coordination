@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from github_infrastructure.change_records import Evidence
 from github_infrastructure.config import settings
+from llm import resolve_model
 from security.guard import make_before_tool_guard
 from security.identities import AgentIdentity
 
@@ -112,7 +113,9 @@ class ImpactAnalysisAgent:
         project: Optional[str] = None,
         database: Optional[str] = None,
     ) -> None:
-        self.model_name = model or DEFAULT_MODEL
+        self.model_name = model or resolve_model(
+            "IMPACT_ANALYSIS_MODEL", "CONTEXT_AGENT_MODEL", default="gemini-3.5-flash"
+        )
         self.project = project or settings.gcp_project
         self.database = database or os.getenv("FIRESTORE_DATABASE", "(default)")
         if not self.project:
@@ -261,8 +264,23 @@ class ImpactAnalysisAgent:
         payload = {"project_id": project_id, "commit_sha": commit_sha}
         if pr_number:
             payload["pr_number"] = pr_number
-        events = asyncio.run(self._run_agent(payload))
-        report = self._extract_report(events)
+        from telemetry.spans import track_agent_run
+
+        with track_agent_run(
+            "impact_analysis_agent",
+            {"project_id": project_id, "pr_number": pr_number or 0},
+        ) as t:
+            events = asyncio.run(self._run_agent(payload))
+            t.set_usage_from_events(events)
+            report = self._extract_report(events)
+            t.set_outputs(
+                {
+                    "output.affected_components": list(getattr(report, "affected_components", None) or []),
+                    "output.affected_count": len(getattr(report, "affected_components", None) or []),
+                    "output.stakeholders": len(getattr(report, "stakeholders", None) or []),
+                    "output.confidence": float(getattr(report, "confidence", 0.0) or 0.0),
+                }
+            )
 
         report.project_id = project_id
         report.commit_sha = commit_sha

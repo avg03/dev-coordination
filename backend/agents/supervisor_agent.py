@@ -16,7 +16,9 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 from pydantic import BaseModel, Field
 
+from autonomy.models import MessageAutonomy
 from github_infrastructure.config import settings
+from llm import resolve_model
 from security.guard import make_before_tool_guard
 from security.identities import AgentIdentity
 
@@ -56,6 +58,12 @@ class SupervisionResult(BaseModel):
         description="Messages to deliver: kept drafts unchanged, revised drafts, no rejected messages",
     )
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    autonomy: list[MessageAutonomy] = Field(
+        default_factory=list,
+        description="Advisory per-message autonomy recommendations "
+        "({message_id, recommendation, reasons, risk_level, confidence}); "
+        "validated downgrade-only by the deterministic autonomy policy.",
+    )
 
 
 SUPERVISION_INSTRUCTION = """
@@ -70,21 +78,34 @@ Workflow you MUST follow:
    - Grounding: every claim must be traceable to the CoordinationPlan tasks
      (component, change_type, reason, evidence) and the ProjectContext. Reject
      invented facts, invented recipients, or invented evidence.
-   - Recipients: the recipient (channel/mode) must match the stakeholder or
-     team_context in the ProjectContext. Reject messages to unknown channels.
-   - Completeness: a message must state what changed (component + change_type),
-     why this person is contacted (reason + impact_type + priority), and cite
-     evidence. Revise when missing.
+    - Recipients: the recipient NAME + TEAM must match a stakeholder in the
+      ProjectContext. One message per affected person — reject duplicates of
+      the same person. Slack IDs, channels and <@...> mentions are resolved
+      by deterministic backend logic after you finish: never invent them and
+      never add them yourself.
+    - Completeness: a message must state what changed (component + change_type),
+      why this person is contacted (reason + impact_type + priority), the
+      required action (or explicit none), and cite evidence. Revise when missing.
    - Tone: concise and actionable.
 4. Produce a SupervisionResult:
    - verdicts: one per draft message (keep/revise/reject) with a grounded reason.
-   - final_messages: the messages to deliver — kept drafts unchanged, revised
-     drafts in revised form, and NO rejected messages. Keep ids stable
-     (msg_1, msg_2, ...). Every final message keeps recipient, team, channel and
-     mode from the draft unless the ProjectContext proves them wrong.
-   - summary + confidence grounded in your review.
+    - final_messages: the messages to deliver — kept drafts unchanged, revised
+      drafts in revised form, and NO rejected messages. Keep ids stable
+      (msg_1, msg_2, ...). Every final message keeps recipient and team;
+      leave channel/slack_user_id empty and write no mentions.
+    - summary + confidence grounded in your review.
+4b. For EACH final message, add an autonomy advisory entry
+    {message_id, recommendation, reasons, risk_level, confidence} where
+    recommendation is one of AUTO_SEND (only for routine, low-risk,
+    evidence-backed FYI with a valid mapped recipient), HUMAN_REVIEW
+    (default: anything needing judgment, action, approval, or with
+    doubt), BLOCK (invalid data, unmapped recipient, prohibited target),
+    SKIP (no notification value). Evaluate evidence quality, impact
+    severity, risk, confidence, recipient mapping, and message
+    correctness. Your recommendation is advisory: deterministic policy
+    validates it downgrade-only and humans stay in the loop.
 5. You MUST call save_supervised_communication with project_id, pr_number and
-   the complete supervision result, then return the same JSON as final output.
+    the complete supervision result, then return the same JSON as final output.
 
 Rules:
 - Never invent new recipients, channels or evidence.
@@ -100,7 +121,9 @@ class SupervisorAgent:
         project: Optional[str] = None,
         database: Optional[str] = None,
     ) -> None:
-        self.model_name = model or DEFAULT_MODEL
+        self.model_name = model or resolve_model(
+            "SUPERVISOR_MODEL", "CONTEXT_AGENT_MODEL", default="gemini-3.5-flash"
+        )
         self.project = project or settings.gcp_project
         self.database = database or os.getenv("FIRESTORE_DATABASE", "(default)")
         if not self.project:
@@ -202,7 +225,10 @@ class SupervisorAgent:
         pr_number: int,
         coordination_summary: str = "",
         draft_messages: Optional[list[dict[str, Any]]] = None,
+        autonomy_context: Optional[dict[str, Any]] = None,
     ) -> SupervisionResult:
+        """Autonomy context (optional, deterministic): impact confidence,
+        risks, evidence counts used for the advisory autonomy evaluation."""
         if not project_id or not project_id.strip():
             raise ValueError("project_id cannot be empty")
         if pr_number <= 0:
@@ -218,9 +244,23 @@ class SupervisorAgent:
             "pr_number": pr_number,
             "coordination_summary": coordination_summary,
             "draft_messages": draft_messages or [],
+            "autonomy_context": autonomy_context or {},
         }
-        events = asyncio.run(self._run_agent(payload))
-        result = self._extract_result(events)
+        from telemetry.spans import track_agent_run
+
+        with track_agent_run(
+            "supervisor_agent", {"project_id": project_id, "pr_number": pr_number}
+        ) as t:
+            events = asyncio.run(self._run_agent(payload))
+            t.set_usage_from_events(events)
+            result = self._extract_result(events)
+            t.set_outputs(
+                {
+                    "output.final_messages": len(getattr(result, "final_messages", None) or []),
+                    "output.summary": str(getattr(result, "summary", "") or ""),
+                    "output.autonomy_advisories": len(getattr(result, "autonomy", None) or []),
+                }
+            )
         result.project_id = project_id
         result.pr_number = pr_number
 

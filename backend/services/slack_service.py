@@ -88,3 +88,41 @@ def check_slack_connection() -> dict[str, Any]:
         return {"ok": bool(resp.get("ok")), "team": resp.get("team"), "user": resp.get("user"), "response": resp.data}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+class ChannelThrottler:
+    """Per-channel pacing for Slack sends (chat.postMessage is rate-limited).
+
+    Sequential sends to the SAME channel wait until `delay_seconds` elapsed
+    since the previous send; different channels are independent. Uses a
+    monotonic clock so system time changes cannot collapse the gap.
+    """
+
+    def __init__(self, delay_seconds: float = 1.0) -> None:
+        import time
+
+        self._time = time
+        try:
+            self.delay = max(0.0, float(delay_seconds))
+        except (TypeError, ValueError):
+            self.delay = 1.0
+        self._last_sent: dict[str, float] = {}
+
+    def wait(self, channel: str) -> None:
+        if not self.delay or not channel:
+            return
+        now = self._time.monotonic()
+        last = self._last_sent.get(channel)
+        if last is not None:
+            remaining = self.delay - (now - last)
+            if remaining > 0:
+                self._time.sleep(remaining)
+                now = self._time.monotonic()
+        self._last_sent[channel] = now
+
+
+def send_delay_seconds(default: float = 1.0) -> float:
+    try:
+        return max(0.0, float(os.getenv("SLACK_SEND_DELAY_SECONDS", str(default))))
+    except ValueError:
+        return default

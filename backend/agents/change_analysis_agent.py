@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from github_infrastructure.change_records import ChangeRecord
 from github_infrastructure.config import settings
+from llm import resolve_model
 from security.guard import make_before_tool_guard
 from security.identities import AgentIdentity
 
@@ -94,7 +95,9 @@ class ChangeAnalysisAgent:
         project: Optional[str] = None,
         database: Optional[str] = None,
     ) -> None:
-        self.model_name = model or DEFAULT_MODEL
+        self.model_name = model or resolve_model(
+            "CHANGE_ANALYSIS_MODEL", "CONTEXT_AGENT_MODEL", default="gemini-3.5-flash"
+        )
         self.project = project or settings.gcp_project
         self.database = database or os.getenv("FIRESTORE_DATABASE", "(default)")
         if not self.project:
@@ -183,8 +186,23 @@ class ChangeAnalysisAgent:
             "project_id": project_id,
             "change_record": change_record.model_dump(mode="json"),
         }
-        events = asyncio.run(self._run_agent(payload))
-        enriched = self._extract_enriched(events)
+        from telemetry.spans import track_agent_run
+
+        with track_agent_run("change_analysis_agent", {"project_id": project_id}) as t:
+            events = asyncio.run(self._run_agent(payload))
+            t.set_usage_from_events(events)
+            enriched = self._extract_enriched(events)
+            t.set_outputs(
+                {
+                    "change.type": getattr(enriched, "change_type", ""),
+                    "output.components": list(
+                        getattr(enriched, "components", None)
+                        or getattr(enriched, "impact_scope", None)
+                        or []
+                    ),
+                    "output.confidence": float(getattr(enriched, "confidence", 0.0) or 0.0),
+                }
+            )
 
         if change_record.change_type != "unknown" and enriched.change_type != change_record.change_type:
             enriched.change_type = change_record.change_type

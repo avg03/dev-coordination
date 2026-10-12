@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from github_infrastructure.change_records import ChangeType, Evidence
 from github_infrastructure.config import settings
+from llm import resolve_model
 from security.guard import make_before_tool_guard
 from security.identities import AgentIdentity
 
@@ -103,7 +104,9 @@ class CoordinationAgent:
         project: Optional[str] = None,
         database: Optional[str] = None,
     ) -> None:
-        self.model_name = model or DEFAULT_MODEL
+        self.model_name = model or resolve_model(
+            "COORDINATION_MODEL", "CONTEXT_AGENT_MODEL", default="gemini-3.5-flash"
+        )
         self.project = project or settings.gcp_project
         self.database = database or os.getenv("FIRESTORE_DATABASE", "(default)")
         if not self.project:
@@ -192,8 +195,19 @@ class CoordinationAgent:
         self.saved_by_tool = False
 
         payload = {"project_id": project_id, "commit_sha": commit_sha}
-        events = asyncio.run(self._run_agent(payload))
-        plan = self._extract_plan(events)
+        from telemetry.spans import track_agent_run
+
+        with track_agent_run("coordination_agent", {"project_id": project_id}) as t:
+            events = asyncio.run(self._run_agent(payload))
+            t.set_usage_from_events(events)
+            plan = self._extract_plan(events)
+            t.set_outputs(
+                {
+                    "output.tasks": len(getattr(plan, "tasks", None) or []),
+                    "output.requires_approval": bool(getattr(plan, "requires_approval", False)),
+                    "output.summary": str(getattr(plan, "summary", "") or ""),
+                }
+            )
         plan.project_id = project_id
         plan.commit_sha = commit_sha
 

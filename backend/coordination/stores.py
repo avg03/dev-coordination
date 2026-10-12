@@ -168,8 +168,13 @@ class FirestorePRWorkflowStore:
         ).set(record.model_dump(mode="json"))
 
     def list_waiting(self) -> list[PRWorkflowRecord]:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
         out: list[PRWorkflowRecord] = []
-        for doc in self._get_client().collection(PR_WORKFLOWS_COLLECTION).where("status", "==", "WAITING_FOR_COMMITS").stream():
+        query = self._get_client().collection(PR_WORKFLOWS_COLLECTION).where(
+            filter=FieldFilter("status", "==", "WAITING_FOR_COMMITS")
+        )
+        for doc in query.stream():
             try:
                 out.append(PRWorkflowRecord.model_validate(doc.to_dict() or {}))
             except Exception:
@@ -177,12 +182,14 @@ class FirestorePRWorkflowStore:
         return out
 
     def list_waiting_for_commit(self, commit_sha: str) -> list[PRWorkflowRecord]:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
         out: list[PRWorkflowRecord] = []
         query = (
             self._get_client()
             .collection(PR_WORKFLOWS_COLLECTION)
-            .where("status", "==", "WAITING_FOR_COMMITS")
-            .where("required_shas", "array_contains", commit_sha)
+            .where(filter=FieldFilter("status", "==", "WAITING_FOR_COMMITS"))
+            .where(filter=FieldFilter("required_shas", "array_contains", commit_sha))
         )
         for doc in query.stream():
             try:
@@ -192,12 +199,14 @@ class FirestorePRWorkflowStore:
         return out
 
     def list_for_pr(self, project_id: str, pr_number: int) -> list[PRWorkflowRecord]:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
         out: list[PRWorkflowRecord] = []
         query = (
             self._get_client()
             .collection(PR_WORKFLOWS_COLLECTION)
-            .where("project_id", "==", project_id)
-            .where("pr_number", "==", pr_number)
+            .where(filter=FieldFilter("project_id", "==", project_id))
+            .where(filter=FieldFilter("pr_number", "==", pr_number))
         )
         for doc in query.stream():
             try:
@@ -282,8 +291,13 @@ class FirestoreOutboxStore:
             return None
 
     def list_pending(self) -> list[CompletionOutboxEntry]:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
         out: list[CompletionOutboxEntry] = []
-        for doc in self._get_client().collection(COMPLETION_OUTBOX_COLLECTION).where("published", "==", False).stream():
+        query = self._get_client().collection(COMPLETION_OUTBOX_COLLECTION).where(
+            filter=FieldFilter("published", "==", False)
+        )
+        for doc in query.stream():
             try:
                 out.append(CompletionOutboxEntry.model_validate(doc.to_dict() or {}))
             except Exception:

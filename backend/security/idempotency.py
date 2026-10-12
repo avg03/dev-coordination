@@ -120,19 +120,16 @@ class FirestoreIdempotencyStore:
         return self._to_record(snap.to_dict() or {})
 
     def create_if_absent(self, record: IdempotencyRecord) -> bool:
-        client = self._get_client()
+        """Atomic create-if-absent via Firestore create() (fails with
+        AlreadyExists when the key is taken — no transaction needed)."""
+        from google.api_core.exceptions import AlreadyExists
 
-        @firestore.transactional
-        def _txn(transaction: Any) -> bool:
-            ref = client.collection(IDEMPOTENCY_COLLECTION).document(record.key)
-            snapshot = transaction.get(ref)
-            if snapshot.exists:
-                return False
-            transaction.set(ref, record.model_dump(mode="json"))
+        ref = self._get_client().collection(IDEMPOTENCY_COLLECTION).document(record.key)
+        try:
+            ref.create(record.model_dump(mode="json"))
             return True
-
-        transaction = client.transaction()
-        return _txn(transaction)
+        except AlreadyExists:
+            return False
 
     def update(self, record: IdempotencyRecord) -> None:
         self._get_client().collection(IDEMPOTENCY_COLLECTION).document(record.key).set(

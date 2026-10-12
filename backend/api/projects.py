@@ -287,6 +287,160 @@ class ApprovePRRequest(BaseModel):
     )
 
 
+class SlackMappingEntry(BaseModel):
+    name: str = Field(min_length=1, description="Stakeholder name (matches ProjectContext stakeholder)")
+    team: str = Field(min_length=1, description="Team the person belongs to")
+    role: str = Field(default="", description="Role in the organization")
+    slack_user_id: str = Field(min_length=1, description="Slack user ID, e.g. U012345")
+    communication_preference: str = Field(default="both", description="group | personal | both")
+
+
+class SlackMappingsRequest(BaseModel):
+    default_slack_channel_id: str = Field(
+        default="", description="Single channel all per-person notifications go to, e.g. C012345"
+    )
+    stakeholders: list[SlackMappingEntry] = Field(
+        default_factory=list, description="Role/person to Slack user ID mappings (upsert by name+team)"
+    )
+
+
+class SlackMappingsResponse(BaseModel):
+    success: bool = Field(default=True)
+    project_context: ProjectContextOutput = Field(description="Updated project context with mappings applied")
+
+
+@router.get(
+    "/{project_id}/context",
+    response_model=ProjectContextResponse,
+    summary="Get the stored project context (Slack Mapping page source of truth)",
+)
+def get_project_context(
+    project_id: str,
+    client=Depends(get_firestore_client),
+) -> ProjectContextResponse:
+    if not project_id or not project_id.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="project_id cannot be empty")
+    try:
+        snap = client.collection("project_contexts").document(project_id).get()
+    except Exception as exc:
+        logger.exception("Failed to fetch project context for %s", project_id)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch context") from exc
+    if not snap.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project context not found for {project_id}. Create it on the Project Context page first.",
+        )
+    try:
+        return ProjectContextResponse(success=True, project_context=ProjectContextOutput.model_validate(snap.to_dict()))
+    except Exception as exc:
+        logger.warning("Invalid ProjectContext shape for %s", project_id)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Stored context is invalid") from exc
+
+
+@router.put(
+    "/{project_id}/slack-mappings",
+    response_model=SlackMappingsResponse,
+    summary="Admin: map roles/persons to Slack user IDs (+ default channel). Merges into the existing context; never creates duplicates.",
+)
+def update_slack_mappings(
+    project_id: str,
+    payload: SlackMappingsRequest,
+    client=Depends(get_firestore_client),
+) -> SlackMappingsResponse:
+    from project_context.models import is_valid_slack_channel_id, is_valid_slack_user_id
+
+    if not project_id or not project_id.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="project_id cannot be empty")
+
+    channel = (payload.default_slack_channel_id or "").strip()
+    if channel and not is_valid_slack_channel_id(channel):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid Slack channel ID {channel!r}: expected like C012345 (C/G/D + alphanumerics)",
+        )
+
+    # Entry validation: user-ID format + no duplicates (by user ID or name+team).
+    seen_users: set[str] = set()
+    seen_people: set[tuple[str, str]] = set()
+    for entry in payload.stakeholders:
+        uid = entry.slack_user_id.strip()
+        if not is_valid_slack_user_id(uid):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid Slack user ID {uid!r} for {entry.name}: expected like U012345",
+            )
+        if uid in seen_users:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Duplicate Slack user ID {uid!r}: one user maps to one person",
+            )
+        seen_users.add(uid)
+        key = (entry.name.strip().lower(), entry.team.strip().lower())
+        if key in seen_people:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Duplicate mapping for {entry.name} ({entry.team})",
+            )
+        seen_people.add(key)
+        if entry.communication_preference not in ("group", "personal", "both"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid communication_preference {entry.communication_preference!r} for {entry.name}",
+            )
+
+    try:
+        doc_ref = client.collection("project_contexts").document(project_id)
+        snap = doc_ref.get()
+    except Exception as exc:
+        logger.exception("Failed to fetch project context for %s", project_id)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch context") from exc
+    if not snap.exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Project context not found for {project_id}. Create it on the Project Context page first (no duplicate contexts are created here).",
+        )
+
+    try:
+        stored = ProjectContextOutput.model_validate(snap.to_dict())
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Stored context is invalid") from exc
+
+    # Merge: channel + upsert stakeholders by (name, team). Never duplicates.
+    if channel:
+        stored.default_slack_channel_id = channel
+    by_key = {(s.name.strip().lower(), s.team.strip().lower()): s for s in stored.stakeholders}
+    for entry in payload.stakeholders:
+        key = (entry.name.strip().lower(), entry.team.strip().lower())
+        existing = by_key.get(key)
+        if existing is None:
+            from project_context.models import Stakeholder
+
+            by_key[key] = Stakeholder(
+                name=entry.name.strip(),
+                role=entry.role.strip(),
+                team=entry.team.strip(),
+                slack_user_id=entry.slack_user_id.strip(),
+                communication_preference=entry.communication_preference,  # type: ignore[arg-type]
+            )
+        else:
+            existing.slack_user_id = entry.slack_user_id.strip()
+            if entry.role.strip():
+                existing.role = entry.role.strip()
+            existing.communication_preference = entry.communication_preference  # type: ignore[assignment]
+    stored.stakeholders = list(by_key.values())
+
+    from datetime import datetime, timezone
+
+    stored.metadata.updated_at = datetime.now(timezone.utc).isoformat()
+    try:
+        doc_ref.set(stored.model_dump(mode="json"), merge=True)
+    except Exception as exc:
+        logger.exception("Failed to save Slack mappings for %s", project_id)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to save mappings") from exc
+    logger.info("Slack mappings updated project_id=%s channel=%s people=%d", project_id, channel, len(payload.stakeholders))
+    return SlackMappingsResponse(success=True, project_context=stored)
+
+
 class ApprovePRResponse(BaseModel):
     success: bool = Field(description="Whether approval was processed")
     delivery_status: str = Field(description="Delivery status: sent, rejected, failed, mock_sent")
@@ -402,6 +556,22 @@ def approve_pr(
     sent_results: list[dict] = []
     denied_any = False
 
+    # Sequential, per-channel pacing: Slack rate-limits chat.postMessage, so
+    # approved messages queue behind a throttle instead of bursting.
+    from services.slack_service import ChannelThrottler, send_delay_seconds
+
+    throttler = ChannelThrottler(send_delay_seconds())
+
+    # Autonomy enforcement (best-effort): BLOCKED/SKIPPED messages from the
+    # risk policy can never be approved; HUMAN_REVIEW and delivered-or-pending
+    # AUTO_SEND follow the normal path. Absent batch = autonomy off = unchanged.
+    try:
+        from autonomy.runner import load_decisions
+
+        autonomy_map = load_decisions(project_id, pr_number, client)
+    except Exception:
+        autonomy_map = {}
+
     for mid in target_ids:
         msg = id_to_msg[mid]
         channel = msg.get("channel") or ""
@@ -414,6 +584,42 @@ def approve_pr(
             )
             denied_any = True
             continue
+        if msg.get("unmapped"):
+            # No valid Slack mapping: never send untagged. Record + surface
+            # for correction on the Slack Mapping page (gateway would deny
+            # the empty channel anyway; this makes the reason explicit).
+            logger.warning("Skipping unmapped message %s (no Slack user mapping)", mid)
+            sent_results.append(
+                {
+                    "id": mid,
+                    "channel": channel,
+                    "result": {
+                        "status": "denied",
+                        "ok": False,
+                        "error": "no Slack mapping for recipient — map them on the Slack Mapping page, then re-approve",
+                    },
+                }
+            )
+            denied_any = True
+            continue
+        auto = autonomy_map.get(mid)
+        if isinstance(auto, dict) and auto.get("decision") in ("BLOCK", "SKIP"):
+            reasons = "; ".join(auto.get("reasons", []) or [])[:300] or auto.get("decision", "")
+            logger.warning("Autonomy %s blocks approval of message %s: %s", auto.get("decision"), mid, reasons)
+            sent_results.append(
+                {
+                    "id": mid,
+                    "channel": channel,
+                    "result": {
+                        "status": "denied",
+                        "ok": False,
+                        "error": f"autonomy {auto.get('decision')}: {reasons}",
+                    },
+                }
+            )
+            denied_any = True
+            continue
+        throttler.wait(channel)
         delivery = executor.execute_send(project_id, pr_number, msg, approval_id)
         sent_results.append(
             {

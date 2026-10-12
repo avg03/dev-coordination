@@ -158,11 +158,30 @@ def _enrich_with_gate(
     for project_id in project_ids:
         _mark_processing(record, project_id, status_store=status_store)
         try:
-            agent = ChangeAnalysisAgent(
-                project=settings.gcp_project,
-                database=os.getenv("FIRESTORE_DATABASE", "(default)"),
-            )
-            enriched, path, saved_by_tool = agent.analyze(project_id, record)
+            from telemetry.spans import set_span_attrs as _set_span_attrs
+            from telemetry.spans import workflow_span as _workflow_span
+
+            with _workflow_span(
+                "commit.enrich",
+                {
+                    "project_id": project_id,
+                    "repo": record.repository,
+                    "commit.sha": record.commit_sha[:12],
+                },
+            ) as _espan:
+                agent = ChangeAnalysisAgent(
+                    project=settings.gcp_project,
+                    database=os.getenv("FIRESTORE_DATABASE", "(default)"),
+                )
+                enriched, path, saved_by_tool = agent.analyze(project_id, record)
+                _set_span_attrs(
+                    _espan,
+                    {
+                        "change.type": getattr(enriched, "change_type", ""),
+                        "output.confidence": float(getattr(enriched, "confidence", 0.0) or 0.0),
+                        "commit.status": "completed",
+                    },
+                )
             logger.info(
                 "Enriched record created for %s@%s -> %s (saved_by_tool=%s)",
                 record.repository,

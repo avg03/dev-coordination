@@ -29,6 +29,9 @@ from api_client import (  # noqa: E402
     get_backend_url,
     get_pr_review,
     get_project_commits,
+    get_project_context,
+    get_project_id,
+    update_slack_mappings,
 )
 
 st.set_page_config(
@@ -109,6 +112,29 @@ def _extract_messages(bundle: dict | None) -> list[dict]:
         return [m for m in nested_msgs if isinstance(m, dict)]
     # Fallback: total shape where bundle is CommunicationResult directly
     return []
+
+
+def _recommendation(msg: dict) -> tuple[bool, str]:
+    """Notify-first preference: mapped + must-act beats FYI.
+
+    Recommended when the recipient is mapped AND (action_required OR
+    impact is action/approval OR priority high/critical). Unmapped and
+    pure-awareness messages are never preselected. Human still approves.
+    """
+    if not isinstance(msg, dict) or msg.get("unmapped"):
+        return False, ""
+    reasons: list[str] = []
+    if msg.get("action_required"):
+        reasons.append("action required")
+    itype = str(msg.get("impact_type") or "").lower()
+    if itype in ("action", "approval"):
+        reasons.append(f"impact: {itype}")
+    prio = str(msg.get("priority") or "").lower()
+    if prio in ("high", "critical"):
+        reasons.append(f"priority: {prio}")
+    if not reasons:
+        return False, ""
+    return True, "; ".join(reasons)
 
 
 def _render_project_context_structured(ctx: dict) -> None:
@@ -540,24 +566,22 @@ with st.sidebar:
     if "project_id" not in st.session_state:
         st.session_state["project_id"] = ""
     st.subheader("Project")
-    sidebar_project_id = st.text_input(
-        "Project ID",
-        value=st.session_state["project_id"],
-        placeholder="e.g. my-project",
-        help="Client-provided project identifier (Firestore document ID). Used across all pages.",
-        key="sidebar_project_id_input",
-    )
-    if sidebar_project_id != st.session_state["project_id"]:
-        st.session_state["project_id"] = sidebar_project_id.strip()
-    if st.session_state["project_id"]:
-        st.caption(f"Active project: `{st.session_state['project_id']}`")
-    else:
-        st.caption("No project selected — enter a Project ID to begin.")
+    # Single-project mode: fixed ID from frontend/.env PROJECT_ID (one repo -> one project).
+    try:
+        fixed_project_id = get_project_id()
+    except BackendApiError as exc:
+        fixed_project_id = ""
+        st.warning(str(exc))
+        st.caption("Set PROJECT_ID in frontend/.env, then rerun (`streamlit run streamlit_app.py`).")
+    st.session_state["project_id"] = fixed_project_id
+    if fixed_project_id:
+        st.code(fixed_project_id, language="text")
+        st.caption("Single-project mode — all pages use this ID.")
     st.divider()
     st.subheader("Navigation")
     page = st.radio(
         "Go to",
-        options=["Project Context", "Work Journey", "PR Review"],
+        options=["Project Context", "Work Journey", "PR Review", "Slack Mapping"],
         index=0,
         label_visibility="collapsed",
         key="nav_radio",
@@ -566,6 +590,9 @@ with st.sidebar:
     st.caption("Frontend is a thin client. All logic lives in the backend via `api_client.py`.")
 
 project_id: str = st.session_state.get("project_id", "").strip()
+if not project_id:
+    st.warning("PROJECT_ID is not configured — set it in frontend/.env and rerun.")
+    st.stop()
 
 st.header("Impact-Aware Engineering Change Coordinator")
 st.caption("Understand the evolution → reason about impact → coordinate the organization.")
@@ -584,12 +611,8 @@ if page == "Project Context":
         st.session_state["pc_description"] = ""
 
     with st.form("project_context_form", clear_on_submit=False):
-        form_project_id = st.text_input(
-            "Project ID",
-            value=project_id,
-            placeholder="my-project",
-            help="Must match the ID you will use for commits and PRs.",
-        )
+        st.code(project_id, language="text")
+        st.caption("Fixed project ID from frontend/.env — context is created/updated for this project only.")
         project_description = st.text_area(
             "Project description",
             value=st.session_state["pc_description"],
@@ -603,17 +626,12 @@ if page == "Project Context":
     st.session_state["pc_description"] = project_description
 
     if submitted:
-        pid = form_project_id.strip()
-        if not pid:
-            st.warning("Project ID is required.")
-        elif not project_description.strip():
+        if not project_description.strip():
             st.warning("Project description is required.")
         else:
-            st.session_state["project_id"] = pid
-            project_id = pid
             with st.spinner("Creating project context..."):
                 try:
-                    result = create_project_context(pid, project_description.strip())
+                    result = create_project_context(project_id, project_description.strip())
                     st.session_state["project_context_result"] = result
                     st.session_state["project_context_error"] = None
                 except Exception as exc:  # noqa: BLE001
@@ -636,12 +654,9 @@ if page == "Project Context":
         else:
             _json_view(res)
 
-    if not project_id and st.session_state.get("project_context_result") is None:
-        st.info("Enter a Project ID in the sidebar or above to get started.")
-
     with st.expander("How this calls the backend", expanded=False):
         st.code("POST /api/projects/context  { project_id, project_description }", language="text")
-        st.caption("via api_client.create_project_context(project_id, project_description)")
+        st.caption("via api_client.create_project_context(project_id, project_description) with the fixed PROJECT_ID")
 
 # ── Work Journey ──────────────────────────────────────────────────────────
 elif page == "Work Journey":
@@ -653,12 +668,8 @@ elif page == "Work Journey":
 
     col1, col2 = st.columns([3, 1])
     with col1:
-        journey_project_id = st.text_input(
-            "Project ID",
-            value=project_id,
-            placeholder="my-project",
-            key="journey_project_id",
-        )
+        st.code(project_id, language="text")
+        st.caption("Fixed project — timeline for this project only.")
     with col2:
         limit_raw = st.selectbox(
             "Limit",
@@ -668,11 +679,6 @@ elif page == "Work Journey":
         )
         limit_val = None if limit_raw == "All" else int(limit_raw)
 
-    journey_project_id = journey_project_id.strip()
-    if journey_project_id and journey_project_id != project_id:
-        st.session_state["project_id"] = journey_project_id
-        project_id = journey_project_id
-
     fetch_journey = st.button("Fetch Commits", key="fetch_journey_btn")
 
     if "journey_result" not in st.session_state:
@@ -681,17 +687,14 @@ elif page == "Work Journey":
         st.session_state["journey_error"] = None
 
     if fetch_journey:
-        if not journey_project_id:
-            st.warning("Project ID is required.")
-        else:
-            with st.spinner("Fetching commit timeline..."):
-                try:
-                    result = get_project_commits(journey_project_id, limit=limit_val)
-                    st.session_state["journey_result"] = result
-                    st.session_state["journey_error"] = None
-                except Exception as exc:  # noqa: BLE001
-                    st.session_state["journey_result"] = None
-                    st.session_state["journey_error"] = exc
+        with st.spinner("Fetching commit timeline..."):
+            try:
+                result = get_project_commits(project_id, limit=limit_val)
+                st.session_state["journey_result"] = result
+                st.session_state["journey_error"] = None
+            except Exception as exc:  # noqa: BLE001
+                st.session_state["journey_result"] = None
+                st.session_state["journey_error"] = exc
 
     err = st.session_state.get("journey_error")
     if err is not None:
@@ -808,12 +811,8 @@ elif page == "PR Review":
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        pr_project_id = st.text_input(
-            "Project ID",
-            value=project_id,
-            placeholder="my-project",
-            key="pr_project_id",
-        )
+        st.code(project_id, language="text")
+        st.caption("Fixed project — PR review for this project only.")
     with col2:
         pr_number_input = st.number_input(
             "PR number",
@@ -823,11 +822,7 @@ elif page == "PR Review":
             key="pr_number_input",
         )
 
-    pr_project_id = pr_project_id.strip()
     pr_number = int(pr_number_input)
-    if pr_project_id and pr_project_id != project_id:
-        st.session_state["project_id"] = pr_project_id
-        project_id = pr_project_id
     st.session_state["pr_number"] = pr_number
 
     col_a, col_b = st.columns([1, 1])
@@ -854,14 +849,12 @@ elif page == "PR Review":
         st.session_state["pr_approve_error"] = None
 
     if fetch_pr:
-        if not pr_project_id:
-            st.warning("Project ID is required.")
-        elif pr_number <= 0:
+        if pr_number <= 0:
             st.warning("PR number must be positive.")
         else:
             with st.spinner(f"Fetching PR #{pr_number} review..."):
                 try:
-                    review = get_pr_review(pr_project_id, pr_number)
+                    review = get_pr_review(project_id, pr_number)
                     st.session_state["pr_review_result"] = review
                     st.session_state["pr_review_error"] = None
                     st.session_state["pr_approve_result"] = None
@@ -887,7 +880,7 @@ elif page == "PR Review":
             st.divider()
             c1, c2, c3 = st.columns(3)
             with c1:
-                st.metric("Project", review.get("project_id", pr_project_id))
+                st.metric("Project", review.get("project_id", project_id))
             with c2:
                 st.metric("PR", f"#{review.get('pr_number', pr_number)}")
             with c3:
@@ -981,14 +974,33 @@ elif page == "PR Review":
 
                         with st.container(border=True):
                             col_check, col_meta = st.columns([1, 5])
+                            _rec, _why = _recommendation(msg)
                             with col_check:
-                                # Explicit user interaction required — default unchecked so user must choose
-                                # Use per-PR key to avoid cross-PR leakage; default False forces explicit click
+                                # Preference preselected, human decides: recommended boxes
+                                # start checked (first render only); anything can be toggled.
                                 if cb_key not in st.session_state:
-                                    st.session_state[cb_key] = False
+                                    st.session_state[cb_key] = _rec
                                 st.checkbox("Send", key=cb_key, help=f"Include {mid} when you click Approve & Send Selected")
                             with col_meta:
-                                st.markdown(f"**{mid}** — **{recipient}** (`{team}`) · `{mode}` · channel `{channel}`")
+                                _rec_badge = " ⭐ Recommended" if _rec else ""
+                                st.markdown(f"**{mid}** — **{recipient}** (`{team}`) · `{mode}` · channel `{channel}`{_rec_badge}")
+                                if _rec:
+                                    st.caption(f"Prefer: {_why}")
+                                _msg_uid = (msg.get("slack_user_id") or "").strip() if isinstance(msg, dict) else ""
+                                if msg.get("unmapped"):
+                                    st.warning("⚠️ No Slack mapping — will be blocked at approval. Map this person on the Slack Mapping page, then re-approve.")
+                                elif _msg_uid:
+                                    st.caption(f"Mention: `<@{_msg_uid}>` → **{recipient}**")
+                                _auto = (msg.get("autonomy") or "").strip().upper() if isinstance(msg, dict) else ""
+                                if _auto == "AUTO_SEND":
+                                    st.caption("🤖 Autonomy: AUTO_SEND (policy-approved, may deliver without review)")
+                                elif _auto == "HUMAN_REVIEW":
+                                    st.caption("👁 Autonomy: HUMAN_REVIEW (needs your approval)")
+                                elif _auto == "BLOCK":
+                                    _br = "; ".join(msg.get("autonomy_reasons") or [])[:300]
+                                    st.error(f"⛔ Autonomy BLOCKED{_br and ': ' + _br}. Cannot be approved.")
+                                elif _auto == "SKIP":
+                                    st.caption("⏭ Autonomy SKIP (no notification needed)")
                                 if title:
                                     st.markdown(f"**Title:** {title}")
                                 meta_parts = []
@@ -1044,8 +1056,15 @@ elif page == "PR Review":
 
                     st.divider()
                     st.markdown("#### Human-in-the-loop approval")
-                    st.caption("Requires explicit click. `Approve & Send Selected` sends only checked IDs. `Approve & Send All` sends all stored messages (`selected_messages: []`). `Reject` blocks delivery.")
+                    st.caption("Requires explicit click. `Approve & Send Selected` sends only checked IDs. `Approve & Send All` sends all stored messages (`selected_messages: []`). `Reject` blocks delivery. ⭐ = recommended (mapped + must-act); toggle anything before approving.")
 
+                    _recommended_ids = [
+                        (m.get("id") or f"msg_{i+1}").strip() or f"msg_{i+1}"
+                        for i, m in enumerate(messages)
+                        if isinstance(m, dict) and _recommendation(m)[0]
+                    ]
+                    if _recommended_ids:
+                        st.info(f"Recommended to notify first: {', '.join(_recommended_ids)} (mapped + action/approval/high-priority)")
                     if selected_ids:
                         st.success(f"Selected: {', '.join(selected_ids)} ({len(selected_ids)}/{len(messages)})")
                     else:
@@ -1081,7 +1100,7 @@ elif page == "PR Review":
                         else:
                             with st.spinner("Approving & sending selected messages..."):
                                 try:
-                                    resp = approve_pr(pr_project_id, pr_number, True, selected_ids)
+                                    resp = approve_pr(project_id, pr_number, True, selected_ids)
                                     st.session_state["pr_approve_result"] = resp
                                     st.session_state["pr_approve_error"] = None
                                 except Exception as exc:  # noqa: BLE001
@@ -1092,7 +1111,7 @@ elif page == "PR Review":
                     if approve_all_btn:
                         with st.spinner("Approving & sending all messages..."):
                             try:
-                                resp = approve_pr(pr_project_id, pr_number, True, [])
+                                resp = approve_pr(project_id, pr_number, True, [])
                                 st.session_state["pr_approve_result"] = resp
                                 st.session_state["pr_approve_error"] = None
                             except Exception as exc:  # noqa: BLE001
@@ -1103,7 +1122,7 @@ elif page == "PR Review":
                     if reject_btn:
                         with st.spinner("Rejecting delivery..."):
                             try:
-                                resp = approve_pr(pr_project_id, pr_number, False, [])
+                                resp = approve_pr(project_id, pr_number, False, [])
                                 st.session_state["pr_approve_result"] = resp
                                 st.session_state["pr_approve_error"] = None
                             except Exception as exc:  # noqa: BLE001
@@ -1128,6 +1147,141 @@ elif page == "PR Review":
         st.code("GET  /api/projects/{project_id}/prs/{pr_number}", language="text")
         st.code("POST /api/projects/{project_id}/prs/{pr_number}/approve  { approved, selected_messages }", language="text")
         st.caption("via api_client.get_pr_review(...) and api_client.approve_pr(...)")
+
+# ── Slack Mapping ─────────────────────────────────────────────────────────
+elif page == "Slack Mapping":
+    import re as _re
+
+    st.subheader("Slack Mapping")
+    st.write(
+        "Map team roles/persons to Slack user IDs. Every approved PR message goes to the "
+        "single channel below with exactly one `<@USER_ID>` mention per affected person. "
+        "Saved into the existing project context — no new project is created."
+    )
+    st.code(project_id, language="text")
+
+    if "mapping_ctx" not in st.session_state:
+        st.session_state["mapping_ctx"] = None
+    if "mapping_error" not in st.session_state:
+        st.session_state["mapping_error"] = None
+    if "mapping_saved" not in st.session_state:
+        st.session_state["mapping_saved"] = None
+
+    if st.button("Load Current Mappings", key="mapping_load_btn"):
+        try:
+            st.session_state["mapping_ctx"] = get_project_context(project_id)
+            st.session_state["mapping_error"] = None
+            st.session_state["mapping_saved"] = None
+        except Exception as exc:  # noqa: BLE001
+            st.session_state["mapping_ctx"] = None
+            st.session_state["mapping_error"] = exc
+
+    if st.session_state.get("mapping_error") is not None:
+        _render_error(st.session_state["mapping_error"])
+
+    _mctx = st.session_state.get("mapping_ctx")
+    _pctx = (_mctx.get("project_context") if isinstance(_mctx, dict) else None) or {}
+    _stakeholders = [s for s in (_pctx.get("stakeholders") or []) if isinstance(s, dict)]
+    _cur_channel = str(_pctx.get("default_slack_channel_id") or "")
+
+    if _mctx is not None:
+        st.markdown("### 1. Notification channel")
+        new_channel = st.text_input(
+            "Default Slack channel ID",
+            value=_cur_channel,
+            placeholder="C012345",
+            help="All per-person PR messages are posted here. Channel IDs look like C/G/D + letters/digits.",
+            key="mapping_channel_input",
+        )
+
+        st.markdown("### 2. People mappings")
+        st.caption("One Slack user ID per person. Duplicates are rejected on save.")
+        edited: list[dict] = []
+        for idx, person in enumerate(_stakeholders):
+            name = str(person.get("name", "") or "")
+            team = str(person.get("team", "") or "")
+            role = str(person.get("role", "") or "")
+            uid = st.text_input(
+                f"{name or '—'} (`{team or '—'}`{f' · {role}' if role else ''})",
+                value=str(person.get("slack_user_id") or ""),
+                placeholder="U012345",
+                key=f"mapping_uid_{idx}",
+            ).strip()
+            edited.append({"name": name, "team": team, "role": role, "slack_user_id": uid})
+
+        st.markdown("### 3. Add a person")
+        with st.form("mapping_add_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                add_name = st.text_input("Name", key="mapping_add_name")
+                add_team = st.text_input("Team", key="mapping_add_team")
+            with c2:
+                add_role = st.text_input("Role", key="mapping_add_role")
+                add_uid = st.text_input("Slack user ID", placeholder="U012345", key="mapping_add_uid")
+            add_go = st.form_submit_button("Add To List")
+        if add_go:
+            if not (add_name or "").strip() or not (add_team or "").strip() or not (add_uid or "").strip():
+                st.warning("Name, team and Slack user ID are all required to add a person.")
+            else:
+                _stakeholders.append({
+                    "name": add_name.strip(), "team": add_team.strip(),
+                    "role": (add_role or "").strip(), "slack_user_id": add_uid.strip(),
+                })
+                _pctx["stakeholders"] = _stakeholders
+                st.session_state["mapping_ctx"] = _mctx
+                st.rerun()
+
+        st.divider()
+        if st.button("Save Mappings", type="primary", key="mapping_save_btn"):
+            problems: list[str] = []
+            chan = (new_channel or "").strip()
+            if chan and not _re.fullmatch(r"[CGD][A-Z0-9]{5,}", chan):
+                problems.append(f"Channel ID {chan!r} looks invalid (expect C/G/D + letters/digits, e.g. C012345).")
+            payload_people: list[dict] = []
+            seen_uids: set[str] = set()
+            seen_keys: set[str] = set()
+            for person in edited:
+                uid = (person["slack_user_id"] or "").strip()
+                if not person["name"] or not person["team"]:
+                    problems.append("Every row needs a name and team.")
+                    continue
+                if not uid:
+                    continue  # unmapped rows are kept as-is (person stays without mention)
+                if not _re.fullmatch(r"[UWB][A-Z0-9]{5,}", uid):
+                    problems.append(f"User ID {uid!r} for {person['name']} looks invalid (expect U/W/B + letters/digits).")
+                    continue
+                if uid in seen_uids:
+                    problems.append(f"Duplicate Slack user ID {uid!r} — one user maps to one person.")
+                    continue
+                seen_uids.add(uid)
+                key = (person["name"].strip().lower(), person["team"].strip().lower())
+                if key in seen_keys:
+                    problems.append(f"Duplicate row for {person['name']} ({person['team']}).")
+                    continue
+                seen_keys.add(key)
+                payload_people.append({
+                    "name": person["name"].strip(), "team": person["team"].strip(),
+                    "role": person["role"].strip(), "slack_user_id": uid,
+                })
+            if problems:
+                for problem in problems:
+                    st.warning(problem)
+            else:
+                try:
+                    saved = update_slack_mappings(project_id, chan, payload_people)
+                    st.session_state["mapping_saved"] = saved
+                    st.session_state["mapping_ctx"] = saved
+                    st.success(f"Saved: channel `{chan or '—'}` · {len(payload_people)} mapped person(s).")
+                except Exception as exc:  # noqa: BLE001
+                    st.session_state["mapping_saved"] = None
+                    _render_error(exc)
+    else:
+        st.info("Click **Load Current Mappings** to edit. (Create the project context first if none exists.)")
+
+    with st.expander("How this calls the backend", expanded=False):
+        st.code("GET /api/projects/{project_id}/context", language="text")
+        st.code("PUT /api/projects/{project_id}/slack-mappings  { default_slack_channel_id, stakeholders[] }", language="text")
+        st.caption("via api_client.get_project_context(...) and api_client.update_slack_mappings(...)")
 
 st.divider()
 st.caption("Frontend is a thin client. No business logic lives here — see `frontend/api_client.py` for backend communication.")

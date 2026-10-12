@@ -21,6 +21,12 @@ except ImportError:  # pragma: no cover
 
 def create_app() -> FastAPI:
     logging.basicConfig(level=logging.INFO)
+    try:
+        from telemetry.tracer import init_telemetry
+
+        init_telemetry()
+    except Exception:
+        logging.getLogger(__name__).warning("Telemetry unavailable — continuing without tracing")
     app = FastAPI(title="Dev Coordination - GitHub Infrastructure", version="0.1.0")
 
     # CORS for Streamlit frontend (default 8501) and local dev

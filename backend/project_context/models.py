@@ -159,6 +159,24 @@ class AgentAnalysisOutput(_BaseModel):
 class ProjectContextOutput(AgentAnalysisOutput):
     raw_context: RawContext = Field(default_factory=RawContext)
     metadata: Metadata = Field(default_factory=Metadata)
+    default_slack_channel_id: str = Field(
+        default="",
+        description="Admin-configured Slack channel all per-person PR notifications go to (e.g., C0XXXXXX). Set via the Slack Mapping UI, never invented by agents.",
+    )
+
+
+def is_valid_slack_channel_id(value: str) -> bool:
+    """Channel/group IDs look like C..., G... (private), D... (IM)."""
+    import re
+
+    return bool(re.fullmatch(r"[CGD][A-Z0-9]{5,}", (value or "").strip()))
+
+
+def is_valid_slack_user_id(value: str) -> bool:
+    """User IDs look like U... (W... for Enterprise Grid, B... for bots)."""
+    import re
+
+    return bool(re.fullmatch(r"[UWB][A-Z0-9]{5,}", (value or "").strip()))
 
 
 CONTEXT_AGENT_INSTRUCTION = """

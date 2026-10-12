@@ -76,6 +76,12 @@ class CompletionConsumer:
         return self.subscriber.topic_path(self.project, self.topic_id)
 
     def ensure_subscription(self) -> None:
+        try:
+            from telemetry.tracer import init_telemetry
+
+            init_telemetry()
+        except Exception:
+            pass
         if self._publisher is None:
             self._publisher = pubsub_v1.PublisherClient()
         try:

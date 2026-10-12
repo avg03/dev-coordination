@@ -54,6 +54,12 @@ class CommitWorker:
         return self._publisher.topic_path(self.project, settings.pubsub_topic)
 
     def ensure_subscription(self) -> None:
+        try:
+            from telemetry.tracer import init_telemetry
+
+            init_telemetry()
+        except Exception:
+            pass
         self._ensure_topic()
         try:
             self.subscriber.create_subscription(

@@ -18,6 +18,7 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
 from github_infrastructure.config import settings
+from llm import resolve_model
 from security.guard import make_before_tool_guard
 from security.identities import AgentIdentity
 
@@ -64,7 +65,7 @@ class ContextAgent:
         project: Optional[str] = None,
         database: Optional[str] = None,
     ) -> None:
-        self.model_name = model or DEFAULT_MODEL
+        self.model_name = model or resolve_model("CONTEXT_AGENT_MODEL", default="gemini-3.5-flash")
         self.project = project or settings.gcp_project
         self.database = database or os.getenv("FIRESTORE_DATABASE", "(default)")
         if not self.project:
@@ -211,9 +212,46 @@ class ContextAgent:
         resolved_id = document_id if document_id else slugify(output.project.name)
         payload = output.model_dump(mode="json")
         payload["saved_at"] = datetime.now(timezone.utc).isoformat()
+        self._carry_over_slack_mappings(resolved_id, payload)
         self.firestore_client.collection(PROJECT_CONTEXTS_COLLECTION).document(resolved_id).set(payload)
         logger.info("Saved project context %s", resolved_id)
         return resolved_id
+
+    def _carry_over_slack_mappings(self, resolved_id: str, payload: dict) -> None:
+        """Re-creating context from a description must not wipe the admin's
+        Slack Mapping page data (channel + per-person user IDs). Matched by
+        (name, team), case-insensitive; new stakeholders keep agent values."""
+        try:
+            snap = (
+                self.firestore_client.collection(PROJECT_CONTEXTS_COLLECTION)
+                .document(resolved_id)
+                .get()
+            )
+            if not snap.exists:
+                return
+            existing = snap.to_dict() or {}
+        except Exception:
+            logger.warning("Slack mapping carry-over skipped for %s", resolved_id)
+            return
+        if existing.get("default_slack_channel_id") and not payload.get("default_slack_channel_id"):
+            payload["default_slack_channel_id"] = existing["default_slack_channel_id"]
+        prior = {
+            (str(s.get("name", "")).strip().lower(), str(s.get("team", "")).strip().lower()): s
+            for s in (existing.get("stakeholders") or [])
+            if isinstance(s, dict)
+        }
+        if not prior:
+            return
+        for current in payload.get("stakeholders") or []:
+            if not isinstance(current, dict):
+                continue
+            key = (str(current.get("name", "")).strip().lower(), str(current.get("team", "")).strip().lower())
+            old = prior.get(key)
+            if not old:
+                continue
+            for field in ("slack_user_id", "slack_channel_id", "communication_preference"):
+                if old.get(field) and not current.get(field):
+                    current[field] = old[field]
 
 
 def main(argv: Optional[list[str]] = None) -> int:

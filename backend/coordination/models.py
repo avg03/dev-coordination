@@ -84,6 +84,10 @@ class PRWorkflowRecord(BaseModel):
     failed_shas: list[str] = Field(default_factory=list)
     error: str = Field(default="", description="Safe error summary, no secrets")
     partial: bool = False
+    # Trace linkage (wait -> resume): hex ids of the span that went WAITING.
+    # The resume run attaches an OTel Link to it instead of holding spans open.
+    trace_id: Optional[str] = None
+    span_id: Optional[str] = None
 
     @property
     def workflow_id(self) -> str:

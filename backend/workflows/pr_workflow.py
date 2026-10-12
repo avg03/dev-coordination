@@ -203,11 +203,17 @@ class PRWorkflow:
         def _sync_gate() -> dict[str, Any]:
             from coordination.gate import check_readiness
             from coordination.models import PRWorkflowRecord
+            from telemetry.spans import current_span_ids
 
             timeout = pr_wait_timeout_seconds()
             now = datetime.now(timezone.utc)
             # 1. Load or create state for THIS revision (doc id includes head SHA).
             state = pr_store.get(pr_event.project_id, pr_event.pr_number, pr_event.head_sha or "")
+            # Resume linkage: if this revision previously went WAITING, the new
+            # run links back to that trace instead of holding spans open.
+            prior_trace: tuple[Any, Any] = (None, None)
+            if state is not None and state.status == "WAITING_FOR_COMMITS" and state.trace_id:
+                prior_trace = (state.trace_id, state.span_id)
             if state is None:
                 state = PRWorkflowRecord(
                     project_id=pr_event.project_id,
@@ -256,7 +262,7 @@ class PRWorkflow:
                 state.failed_shas = []
                 pr_store.put(state)
                 self._audit_gate(pr_event, workflow_id, "READY", f"{len(commits)} commits ready")
-                return {"decision": "proceed", "state": state.model_dump(mode="json")}
+                return {"decision": "proceed", "state": state.model_dump(mode="json"), "prior_trace": prior_trace}
             # 5. Timeout path: rechecked already; partial when meaningful else FAILED.
             try:
                 deadline = datetime.fromisoformat(str(state.deadline_at)) if state.deadline_at else None
@@ -274,7 +280,7 @@ class PRWorkflow:
                     state.error = f"wait timeout with {available}/{len(commits)} commits; partial analysis"
                     pr_store.put(state)
                     self._audit_gate(pr_event, workflow_id, "READY", "timeout partial")
-                    return {"decision": "proceed", "partial": True, "state": state.model_dump(mode="json")}
+                    return {"decision": "proceed", "partial": True, "state": state.model_dump(mode="json"), "prior_trace": prior_trace}
                 state.status = "FAILED"
                 state.missing_shas = list(missing)
                 state.failed_shas = list(failed)
@@ -286,11 +292,37 @@ class PRWorkflow:
             state.status = "WAITING_FOR_COMMITS"
             state.missing_shas = list(missing)
             state.failed_shas = list(failed)
+            # Span ends here (waiting); the resume run links back via these ids.
+            trace_id, span_id = current_span_ids()
+            if trace_id and span_id:
+                state.trace_id = trace_id
+                state.span_id = span_id
             pr_store.put(state)
             self._audit_gate(pr_event, workflow_id, "WAITING_FOR_COMMITS", f"missing={len(missing)}")
             return {"decision": "wait", "missing": missing, "failed_shas": failed}
 
-        return await asyncio.to_thread(_sync_gate)
+        from telemetry.spans import set_span_attrs, workflow_span
+
+        with workflow_span(
+            "commit.readiness_check",
+            {
+                "project_id": pr_event.project_id,
+                "pr.number": pr_event.pr_number,
+                "pr.head_sha": (pr_event.head_sha or "")[:12],
+                "gate.required_commits": len(commits),
+            },
+        ) as gspan:
+            gate_result = await asyncio.to_thread(_sync_gate)
+            set_span_attrs(
+                gspan,
+                {
+                    "pending_commits": len(gate_result.get("missing") or []),
+                    "failed_commits": len(gate_result.get("failed_shas") or []),
+                    "pr.status": gate_result.get("decision", ""),
+                    "pr.partial": bool(gate_result.get("partial", False)),
+                },
+            )
+            return gate_result
 
     def _audit_gate(self, pr_event: PREvent, workflow_id: str, decision: str, reason: str) -> None:
         try:
@@ -340,8 +372,13 @@ class PRWorkflow:
             ),
         )
 
-    async def _claim_dispatch(self, pr_event: PREvent, workflow_id: str, commits: List[str]) -> str:
-        """Atomically claim PR execution. Returns EXECUTE|COMPLETED|IN_PROGRESS."""
+    async def _claim_dispatch(self, pr_event: PREvent, workflow_id: str, commits: List[str]) -> tuple[str, Optional[dict]]:
+        """Atomically claim PR execution.
+
+        Returns (status, info): status is EXECUTE|COMPLETED|IN_PROGRESS; info
+        identifies OUR claim (key/attempt/lease) so a fast failure can release
+        exactly this claim without touching a peer's.
+        """
         import asyncio
 
         from coordination.config import pr_dispatch_step_name
@@ -355,12 +392,43 @@ class PRWorkflow:
             step_name=pr_dispatch_step_name(), input_payload=fingerprint,
         )
         if outcome.status == ClaimStatus.COMPLETED:
-            return "completed"
+            return "completed", None
         if outcome.status == ClaimStatus.IN_PROGRESS:
-            return "in_progress"
+            return "in_progress", None
         # Mark state PROCESSING under the same claim (crash recovers via lease).
         await self._mark_state_processing(pr_event)
-        return "execute"
+        rec = outcome.record
+        info = {
+            "key": key,
+            "attempt": rec.attempt_count if rec is not None else 1,
+            "lease": rec.lease_until if rec is not None else None,
+        }
+        return "execute", info
+
+    async def _fail_owned_dispatch(self, dispatch_info: Optional[dict], error: str) -> None:
+        """Release ONLY our own dispatch claim after a fast failure, so the
+        next redelivery retries immediately instead of waiting out the lease.
+        A peer's newer/reclaimed claim is never touched (single-flight kept)."""
+        if not dispatch_info:
+            return
+        import asyncio
+
+        def _sync() -> None:
+            try:
+                idem = self._get_idempotency_manager()
+                rec = idem.store.get(dispatch_info["key"])
+                if rec is None or rec.status != "IN_PROGRESS":
+                    return
+                if (rec.attempt_count != dispatch_info["attempt"]
+                        or rec.lease_until != dispatch_info["lease"]):
+                    logger.warning("Dispatch claim changed hands — leaving peer's claim alone")
+                    return
+                idem.fail(dispatch_info["key"], f"owner run failed: {error[:300]}")
+                logger.info("Released owned dispatch claim %s", dispatch_info["key"])
+            except Exception:
+                logger.exception("Failed to release dispatch claim")
+
+        await asyncio.to_thread(_sync)
 
     async def _mark_state_processing(self, pr_event: PREvent) -> None:
         import asyncio
@@ -476,6 +544,28 @@ class PRWorkflow:
         return result
 
     async def run(self, pr_event: PREvent) -> CommunicationBundle:
+        """Traced entry point: root `pr.workflow` span (latency automatic).
+
+        WAITING runs end here with `pr.status=waiting`; the resume run after
+        a completion event links back to the waiting trace (see _gate_check).
+        """
+        from telemetry.spans import annotate_current_span, workflow_span
+
+        with workflow_span(
+            "pr.workflow",
+            {
+                "project_id": pr_event.project_id,
+                "pr.number": pr_event.pr_number,
+                "repo": f"{pr_event.owner}/{pr_event.repository}" if pr_event.owner else pr_event.repository,
+                "pr.head_sha": (pr_event.head_sha or "")[:12],
+                "pr.action": pr_event.action,
+            },
+        ):
+            bundle = await self._run_inner(pr_event)
+            annotate_current_span({"pr.summary": (bundle.summary or "")[:500]})
+            return bundle
+
+    async def _run_inner(self, pr_event: PREvent) -> CommunicationBundle:
         # Fast path: same head SHA already analyzed -> skip LLM calls (prevents 429 loops)
         existing = await self._load_existing_bundle(pr_event)
         if existing is not None:
@@ -490,21 +580,56 @@ class PRWorkflow:
         # --- Readiness gate: never run downstream PR agents until every
         # required commit is COMPLETED with a durable EnrichedChangeRecord.
         gate = await self._gate_check(pr_event, workflow_id, commits)
+        from telemetry.spans import annotate_current_span, link_prior_trace
+
         if gate["decision"] == "wait":
+            annotate_current_span(
+                {"pr.status": "waiting", "pending_commits": len(gate.get("missing") or [])}
+            )
             return self._waiting_bundle(pr_event, gate)
         if gate["decision"] == "failed":
+            annotate_current_span(
+                {"pr.status": "failed", "pending_commits": len(gate.get("missing") or [])}
+            )
             return self._failed_bundle(pr_event, gate)
+        prior = gate.get("prior_trace") or (None, None)
+        if prior[0] and prior[1]:
+            # Resume after wait: link to the waiting trace, don't hold spans open.
+            link_prior_trace(prior[0], prior[1])
+            annotate_current_span({"pr.resumed": True})
         partial = bool(gate.get("partial", False))
+        annotate_current_span({"pr.status": "partial" if partial else "ready"})
 
         # Atomic dispatch claim: concurrent completion events must not launch
         # the same PR workflow twice; crash-after-claim recovers via lease.
-        claimed = await self._claim_dispatch(pr_event, workflow_id, commits)
+        claimed, dispatch_info = await self._claim_dispatch(pr_event, workflow_id, commits)
         if claimed == "completed":
             reloaded = await self._load_existing_bundle(pr_event)
             if reloaded is not None:
                 return reloaded
         elif claimed == "in_progress":
             raise StepInProgressError(f"pr:dispatch is in progress for {workflow_id}")
+
+        try:
+            return await self._run_claimed(pr_event, workflow_id, commits, project_context, partial)
+        except StepInProgressError:
+            raise
+        except Exception as exc:
+            # We owned the claim and failed fast: release it so the next
+            # redelivery retries immediately (peer's claims are never touched).
+            await self._fail_owned_dispatch(dispatch_info, str(exc))
+            raise
+
+    async def _run_claimed(
+        self,
+        pr_event: PREvent,
+        workflow_id: str,
+        commits: List[str],
+        project_context: ProjectContextOutput,
+        partial: bool,
+    ) -> CommunicationBundle:
+        """Post-claim pipeline: enriched load, blast radius, agents, persist."""
+        from telemetry.spans import annotate_current_span
 
         enriched_changes = await self._load_enriched_changes(pr_event.project_id, commits)
         pr_input = self._build_pr_analysis_input(project_context, enriched_changes, pr_event)
@@ -529,9 +654,28 @@ class PRWorkflow:
             "context_updated_at": project_context.metadata.updated_at,
             "analysis_version": ANALYSIS_VERSION,
         }
-        blast_report = await self._run_blast_radius_step(
-            pr_event, workflow_id, blast_radius_fingerprint, project_context
-        )
+        from telemetry.spans import set_span_attrs as _set_span_attrs
+        from telemetry.spans import workflow_span as _workflow_span
+
+        with _workflow_span(
+            "pr.blast_radius",
+            {
+                "project_id": pr_event.project_id,
+                "pr.number": pr_event.pr_number,
+                "pr.head_sha": (pr_event.head_sha or "")[:12],
+            },
+        ) as _bspan:
+            blast_report = await self._run_blast_radius_step(
+                pr_event, workflow_id, blast_radius_fingerprint, project_context
+            )
+            _set_span_attrs(
+                _bspan,
+                {
+                    "output.entries": len(getattr(blast_report, "entries", None) or []),
+                    "output.changed_files": len(getattr(blast_report, "changed_files", None) or []),
+                    "output.incomplete": bool(getattr(blast_report, "incomplete", False)),
+                },
+            )
 
         # Execute agents sequentially - workflow orchestrates, agents don't call each other.
         # Agents reason and persist drafts; nothing here sends Slack.
@@ -544,17 +688,25 @@ class PRWorkflow:
             "coordination:create", pr_event, workflow_id, input_fingerprint,
             lambda: self._run_coordinator_agent(pr_input, impact_report), CoordinationPlan,
         )
+        # PR-level reports now (not after supervision): the supervisor's tool
+        # and the UI read coordination_plans/{pr_number}. Abort if superseded.
+        if not await self._persist_pr_reports(pr_event, impact_report, coordination_plan):
+            return self._stale_bundle(pr_event)
         communication_result = await self._run_step(
             "communication:generate", pr_event, workflow_id, input_fingerprint,
             lambda: self._run_communication_agent(pr_input, coordination_plan), CommunicationResult,
         )
         supervision = await self._run_step(
             "communication:supervise", pr_event, workflow_id, input_fingerprint,
-            lambda: self._run_supervisor_agent(pr_input, coordination_plan, communication_result),
-            SupervisionResult,
+            lambda: self._run_supervisor_agent(pr_input, coordination_plan, communication_result, impact_report), SupervisionResult,
         )
 
         final_messages = supervision.final_messages or communication_result.messages
+        final_messages, mention_issues = self._resolve_mentions(pr_input, final_messages, coordination_plan)
+        final_messages = await self._run_autonomy_stage(
+            pr_event, workflow_id, impact_report, coordination_plan, final_messages,
+            supervisor_autonomy=getattr(supervision, "autonomy", None) or [],
+        )
         communication_bundle = CommunicationBundle(
             project_id=pr_event.project_id,
             pr_number=pr_event.pr_number,
@@ -565,9 +717,18 @@ class PRWorkflow:
             messages=list(final_messages),
             summary=supervision.summary or communication_result.summary,
         )
+        if mention_issues:
+            names = ", ".join(i.get("recipient", "?") for i in mention_issues[:5])
+            communication_bundle.summary = (
+                f"{communication_bundle.summary} [Slack mapping needed for: {names}]"
+            ).strip()
 
         await self._persist_outputs(pr_event, impact_report, coordination_plan, communication_bundle)
-        await self._mark_state_terminal(pr_event, "PARTIAL" if partial else "COMPLETED", partial=partial)
+        terminal = "PARTIAL" if partial else "COMPLETED"
+        annotate_current_span(
+            {"pr.status": terminal.lower(), "output.messages": len(list(final_messages))}
+        )
+        await self._mark_state_terminal(pr_event, terminal, partial=partial)
 
         return communication_bundle
 
@@ -754,11 +915,173 @@ class PRWorkflow:
             raise ValueError("CommunicationAgent did not return a CommunicationResult")
         return result
 
+    async def _run_autonomy_stage(
+        self,
+        pr_event: PREvent,
+        workflow_id: str,
+        impact_report: ImpactReport,
+        coordination_plan: CoordinationPlan,
+        final_messages: list,
+        supervisor_autonomy: list | None = None,
+    ) -> list:
+        """Risk-based autonomous routing (no-op unless AUTONOMY_ENABLED).
+
+        Idempotent evaluate step -> persist batch -> stamp messages ->
+        dispatch AUTO_SEND via existing gateway/idempotency/executor.
+        HUMAN_REVIEW flows into the normal approval bundle; BLOCK/SKIP are
+        stamped and enforced at approve time. Dry-run evaluates only.
+        """
+        from telemetry.spans import annotate_current_span, workflow_span
+
+        from autonomy import config as autonomy_config
+        from autonomy.models import AutonomyBatch
+        from autonomy.runner import dispatch_auto_sends, evaluate_batch
+
+        if not autonomy_config.enabled():
+            return list(final_messages)
+
+        with workflow_span(
+            "pr.autonomy",
+            {"project_id": pr_event.project_id, "pr.number": pr_event.pr_number,
+             "dry_run": autonomy_config.dry_run()},
+        ):
+            fingerprint = {
+                "head_sha": pr_event.head_sha,
+                "messages": [
+                    {"id": getattr(m, "id", ""), "text": getattr(m, "text", "")}
+                    for m in (final_messages or [])
+                ],
+                "impact_confidence": getattr(impact_report, "confidence", 0.0),
+                "policy_version": autonomy_config.POLICY_VERSION,
+                "thresholds": {
+                    "min_confidence": autonomy_config.min_confidence(),
+                    "min_evidence": autonomy_config.min_evidence(),
+                    "allow_action": autonomy_config.allow_action(),
+                },
+            }
+
+            async def _execute() -> AutonomyBatch:
+                import asyncio
+
+                def _sync() -> AutonomyBatch:
+                    return self._evaluate_autonomy_sync(
+                        pr_event, impact_report, coordination_plan, final_messages,
+                        supervisor_autonomy or [],
+                    )
+
+                return await asyncio.to_thread(_sync)
+
+            batch = await self._run_step(
+                "autonomy:evaluate", pr_event, workflow_id, fingerprint, _execute, AutonomyBatch,
+            )
+            await self._persist_autonomy(pr_event, batch)
+
+            stamped = self._stamp_autonomy(final_messages, batch)
+            messages_by_id = {
+                (m.id if hasattr(m, "id") else ""): (
+                    m.model_dump(mode="json") if hasattr(m, "model_dump") else dict(m)
+                )
+                for m in stamped
+            }
+            outcomes = dispatch_auto_sends(
+                batch, messages_by_id, dry_run=autonomy_config.dry_run(),
+            )
+            sent = sum(1 for o in outcomes.values() if o.get("delivered"))
+            annotate_current_span(
+                {
+                    "autonomy.auto_send": sum(1 for d in batch.decisions if d.decision == "AUTO_SEND"),
+                    "autonomy.human_review": sum(1 for d in batch.decisions if d.decision == "HUMAN_REVIEW"),
+                    "autonomy.blocked": sum(1 for d in batch.decisions if d.decision == "BLOCK"),
+                    "autonomy.skipped": sum(1 for d in batch.decisions if d.decision == "SKIP"),
+                    "autonomy.delivered": sent,
+                    "autonomy.dry_run": batch.dry_run,
+                }
+            )
+            return stamped
+
+    def _evaluate_autonomy_sync(
+        self,
+        pr_event: PREvent,
+        impact_report: ImpactReport,
+        coordination_plan: CoordinationPlan,
+        final_messages: list,
+        supervisor_autonomy: list | None = None,
+    ):
+        """Synchronous batch evaluation (runs in a worker thread)."""
+        from autonomy import config as autonomy_config
+        from autonomy.runner import evaluate_batch
+
+        try:
+            impact_dict = impact_report.model_dump(mode="json")
+        except Exception:
+            impact_dict = {}
+        try:
+            plan_dict = coordination_plan.model_dump(mode="json")
+        except Exception:
+            plan_dict = {}
+        messages = [
+            m.model_dump(mode="json") if hasattr(m, "model_dump") else dict(m)
+            for m in (final_messages or [])
+        ]
+        delivered: set[str] = set()
+        try:
+            from security.execution import FirestoreDeliveryStore
+
+            delivered = set(
+                FirestoreDeliveryStore(project=self.project, database=self.database)
+                .read_delivered(pr_event.project_id, pr_event.pr_number)
+                .keys()
+            )
+        except Exception:
+            pass
+        return evaluate_batch(
+            project_id=pr_event.project_id, pr_number=pr_event.pr_number,
+            head_sha=pr_event.head_sha or "", messages=messages,
+            impact=impact_dict, plan=plan_dict,
+            supervisor_autonomy=[
+                dict(s) if isinstance(s, dict) else (
+                    s.model_dump(mode="json") if hasattr(s, "model_dump") else {}
+                )
+                for s in (supervisor_autonomy or [])
+            ],
+            delivered_ids=delivered, dry_run=autonomy_config.dry_run(),
+        )
+
+    @staticmethod
+    def _stamp_autonomy(final_messages: list, batch) -> list:
+        by_id = {d.message_id: d for d in (batch.decisions or [])}
+        stamped = []
+        for m in final_messages or []:
+            decision = by_id.get(getattr(m, "id", "")) if hasattr(m, "id") else None
+            if decision is None:
+                stamped.append(m)
+                continue
+            try:
+                m.autonomy = decision.decision
+                m.autonomy_reasons = list(decision.reasons or [])
+            except Exception:
+                pass
+            stamped.append(m)
+        return stamped
+
+    async def _persist_autonomy(self, pr_event: PREvent, batch) -> None:
+        import asyncio
+
+        def _sync() -> None:
+            self.firestore_client.collection("projects").document(pr_event.project_id).collection(
+                "autonomy"
+            ).document(str(pr_event.pr_number)).set(
+                {**batch.model_dump(mode="json"), "persisted_at": pr_payload_time()}
+            )
+
+        await asyncio.to_thread(_sync)
+
     async def _run_supervisor_agent(
         self,
         pr_input: PRAnalysisInput,
         coordination_plan: CoordinationPlan,
         communication_result: CommunicationResult,
+        impact_report: ImpactReport | None = None,
     ) -> SupervisionResult:
         """Supervisor critiques/validates drafts. No send capability."""
         agent = self.supervisor_agent
@@ -767,13 +1090,73 @@ class PRWorkflow:
         if hasattr(agent, "analyze_pr"):
             return await agent.analyze_pr(pr_input, coordination_plan, communication_result)  # type: ignore
         drafts = [m.model_dump(mode="json") for m in communication_result.messages]
+        autonomy_context: dict[str, Any] = {}
+        try:
+            if impact_report is not None:
+                autonomy_context = {
+                    "impact_confidence": float(getattr(impact_report, "confidence", 0.0) or 0.0),
+                    "risks": list(getattr(impact_report, "risks", None) or []),
+                    "affected_components": list(getattr(impact_report, "affected_components", None) or []),
+                    "evidence_count": len(getattr(impact_report, "evidence", None) or []),
+                    "stakeholders": [
+                        {"team": getattr(s, "team", ""), "impact_type": getattr(s, "impact_type", "")}
+                        for s in (getattr(impact_report, "stakeholders", None) or [])
+                    ],
+                }
+        except Exception:
+            autonomy_context = {}
         return await self._to_thread(
             agent.analyze,
             pr_input.project_id,
             pr_input.pr_number,
             coordination_plan.summary,
             drafts,
+            autonomy_context,
         )
+
+    def _resolve_mentions(self, pr_input: PRAnalysisInput, messages: list, coordination_plan: Any = None) -> tuple[list, list[dict]]:
+        """Deterministic role→Slack ID resolution (V1 mentions).
+
+        The agents produce content + recipient identity only. Here every
+        draft is forced into the single configured channel with exactly one
+        <@USER_ID> mention; unmapped recipients are flagged, never silently
+        sent untagged. Preference signals come from the plan task per team.
+        """
+        from telemetry.spans import annotate_current_span
+
+        from services.slack_mentions import resolve_message_mentions
+
+        try:
+            context_dict = pr_input.project_context.model_dump(mode="json")
+        except Exception:
+            context_dict = {}
+        try:
+            plan_dict = coordination_plan.model_dump(mode="json") if hasattr(coordination_plan, "model_dump") else dict(coordination_plan or {})
+        except Exception:
+            plan_dict = {}
+        default_channel = str(context_dict.get("default_slack_channel_id", "") or "")
+        raw = [m.model_dump(mode="json") if hasattr(m, "model_dump") else dict(m) for m in (messages or [])]
+        resolved_dicts, issues = resolve_message_mentions(
+            raw, context_dict, default_channel, list(plan_dict.get("tasks") or [])
+        )
+        resolved = []
+        for d in resolved_dicts:
+            try:
+                from agents.communication_agent import SlackMessage
+
+                resolved.append(SlackMessage.model_validate(d))
+            except Exception:
+                logger.warning("Dropping unresolvable draft message %s", d.get("id"))
+        annotate_current_span(
+            {
+                "mention.messages": len(resolved),
+                "mention.unmapped": len(issues),
+                "mention.channel": default_channel,
+            }
+        )
+        if issues:
+            logger.warning("PR#%s has %d unmapped Slack recipient(s)", pr_input.pr_number, len(issues))
+        return resolved, issues
 
     async def _persist_outputs(
         self,
@@ -787,35 +1170,17 @@ class PRWorkflow:
         pr_id = str(pr_event.pr_number)
 
         def _sync_persist() -> None:
-            # Stale-revision guard: never let an older head overwrite a newer
-            # revision's result. The gate keys state by head SHA; the bundle
-            # doc is keyed by PR number, so check before overwriting.
+            # Stale-revision guard: abort only when OUR OWN workflow state was
+            # superseded (the gate marks old heads SUPERSEDED when a newer
+            # head registers, so direction is handled there — unlike a raw
+            # head comparison, this never blocks a legitimate head update).
+            if self._is_superseded(pr_event):
+                logger.warning(
+                    "Stale persist blocked for PR#%s head %s (superseded)",
+                    pr_event.pr_number, (pr_event.head_sha or "")[:8],
+                )
+                return
             base = self.firestore_client.collection("projects").document(pr_event.project_id)
-            try:
-                existing = base.collection("communications").document(pr_id).get()
-                if existing.exists:
-                    stored_head = str((existing.to_dict() or {}).get("head_sha", "") or "")
-                    if stored_head and pr_event.head_sha and stored_head != pr_event.head_sha:
-                        # Newer revision already processed (heads differ) — abort
-                        # rather than overwriting. The newer run owns this doc.
-                        logger.warning(
-                            "Stale persist blocked for PR#%s head %s (stored %s)",
-                            pr_event.pr_number, (pr_event.head_sha or "")[:8], stored_head[:8],
-                        )
-                        # Also mark our own state SUPERSEDED for observability.
-                        try:
-                            store = self._get_pr_store()
-                            if store is not None:
-                                mine = store.get(pr_event.project_id, pr_event.pr_number, pr_event.head_sha or "")
-                                if mine is not None and mine.status not in ("COMPLETED", "PARTIAL", "FAILED"):
-                                    mine.status = "SUPERSEDED"
-                                    mine.error = f"superseded by head {stored_head[:8]}"
-                                    store.put(mine)
-                        except Exception:
-                            pass
-                        return
-            except Exception:
-                logger.exception("Stale-guard read failed for PR#%s — proceeding", pr_event.pr_number)
             # Persist under projects/{project_id}/<collection>/{pr_number} as per spec
             # ImpactReport
             impact_payload = impact_report.model_dump(mode="json")
@@ -834,6 +1199,65 @@ class PRWorkflow:
             comm_doc.set({**comm_payload, "pr_number": pr_event.pr_number, "head_sha": pr_event.head_sha, "persisted_at": pr_payload_time()})
 
         await asyncio.to_thread(_sync_persist)
+
+    def _is_superseded(self, pr_event: PREvent) -> bool:
+        """True only when our own head-revision state was superseded by a
+        newer head. Legacy path (no store) returns False — old behavior."""
+        try:
+            store = self._get_pr_store()
+            if store is None:
+                return False
+            mine = store.get(pr_event.project_id, pr_event.pr_number, pr_event.head_sha or "")
+            return mine is not None and mine.status == "SUPERSEDED"
+        except Exception:
+            logger.exception("Supersede check failed for PR#%s — proceeding", pr_event.pr_number)
+            return False
+
+    def _stale_bundle(self, pr_event: PREvent) -> CommunicationBundle:
+        return CommunicationBundle(
+            project_id=pr_event.project_id,
+            pr_number=pr_event.pr_number,
+            owner=pr_event.owner,
+            repository=pr_event.repository,
+            messages=[],
+            summary=(
+                f"PR #{pr_event.pr_number} superseded by a newer revision — "
+                "this run stopped before overwriting newer results."
+            ),
+        )
+
+    async def _persist_pr_reports(
+        self,
+        pr_event: PREvent,
+        impact_report: ImpactReport,
+        coordination_plan: CoordinationPlan,
+    ) -> bool:
+        """Persist PR-level impact + coordination BEFORE supervision, so the
+        supervisor's tool (and the UI) finds the coordination plan instead of
+        warning. Returns False when superseded (caller should abort)."""
+        import asyncio
+
+        pr_id = str(pr_event.pr_number)
+
+        def _sync_persist() -> bool:
+            if self._is_superseded(pr_event):
+                logger.warning(
+                    "Stale run aborted for PR#%s head %s (superseded)",
+                    pr_event.pr_number, (pr_event.head_sha or "")[:8],
+                )
+                return False
+            base = self.firestore_client.collection("projects").document(pr_event.project_id)
+            base.collection("impact_reports").document(pr_id).set(
+                {**impact_report.model_dump(mode="json"), "pr_number": pr_event.pr_number,
+                 "persisted_at": pr_payload_time()}
+            )
+            base.collection("coordination_plans").document(pr_id).set(
+                {**coordination_plan.model_dump(mode="json"), "pr_number": pr_event.pr_number,
+                 "persisted_at": pr_payload_time()}
+            )
+            return True
+
+        return await asyncio.to_thread(_sync_persist)
 
     # --- internal helpers to avoid business logic leakage ---
 

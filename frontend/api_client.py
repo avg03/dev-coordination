@@ -58,6 +58,24 @@ class BackendApiError(RuntimeError):
         return " | ".join(parts)
 
 
+def get_project_id() -> str:
+    """Return the fixed single-project ID from PROJECT_ID env.
+
+    Single-project mode: one repo -> one project. All pages use this;
+    there is no per-page Project ID input anymore.
+
+    Raises:
+        BackendApiError: if PROJECT_ID is not set.
+    """
+    pid = os.getenv("PROJECT_ID", "").strip()
+    if not pid:
+        raise BackendApiError(
+            "PROJECT_ID environment variable is not set. "
+            "Set PROJECT_ID in frontend/.env to the single project ID, e.g. my-project"
+        )
+    return pid
+
+
 def get_backend_url() -> str:
     """Return the configured backend base URL (without trailing slash).
 
@@ -294,6 +312,42 @@ def approve_pr(
     result = _request(
         "POST",
         f"/api/projects/{project_id.strip()}/prs/{pr_number}/approve",
+        json=payload,
+    )
+    if isinstance(result, list):
+        return {"data": result}
+    return result  # type: ignore[return-value]
+
+
+def get_project_context(project_id: str) -> dict[str, Any]:
+    """GET /api/projects/{project_id}/context — stored context (mapping source of truth)."""
+    if not project_id or not project_id.strip():
+        raise ValueError("project_id cannot be empty")
+    result = _request("GET", f"/api/projects/{project_id.strip()}/context")
+    if isinstance(result, list):
+        return {"data": result}
+    return result  # type: ignore[return-value]
+
+
+def update_slack_mappings(
+    project_id: str,
+    default_slack_channel_id: str,
+    stakeholders: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """PUT /api/projects/{project_id}/slack-mappings — admin role→Slack ID mapping.
+
+    Merges into the existing context; never creates a new project.
+    Raises BackendApiError (400 validation, 404 no context) / ValueError.
+    """
+    if not project_id or not project_id.strip():
+        raise ValueError("project_id cannot be empty")
+    payload = {
+        "default_slack_channel_id": (default_slack_channel_id or "").strip(),
+        "stakeholders": stakeholders or [],
+    }
+    result = _request(
+        "PUT",
+        f"/api/projects/{project_id.strip()}/slack-mappings",
         json=payload,
     )
     if isinstance(result, list):

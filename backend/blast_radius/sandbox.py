@@ -131,8 +131,12 @@ class SandboxManager:
                 if response.status_code in (401, 403):
                     raise SandboxError(f"not authorized to fetch snapshot for {handle.repo} ({response.status_code})")
                 response.raise_for_status()
-                # Stream straight into tarfile extraction — token never on disk.
-                with tarfile.open(fileobj=response.iter_bytes(), mode="r|gz", errorlevel=1) as tar:
+                # Buffer into memory for tarfile (it needs a .read() file
+                # object; iter_bytes() is only an iterator). Token stays in
+                # the header — never on disk.
+                import io
+
+                with tarfile.open(fileobj=io.BytesIO(response.read()), mode="r:gz", errorlevel=1) as tar:
                     _safe_extract(tar, handle.workspace_root)
         except SandboxError:
             raise

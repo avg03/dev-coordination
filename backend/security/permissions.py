@@ -46,6 +46,7 @@ PERMISSION_MATRIX: dict[str, set[tuple[Action, Resource]]] = {
         (Action.WRITE, Resource.COMMUNICATIONS),
     },
     AgentIdentity.SUPERVISOR_AGENT.value: {
+        (Action.READ, Resource.PROJECT_CONTEXT),
         (Action.READ, Resource.IMPACT_REPORTS),
         (Action.READ, Resource.COORDINATION_PLANS),
         (Action.READ, Resource.COMMUNICATIONS),
