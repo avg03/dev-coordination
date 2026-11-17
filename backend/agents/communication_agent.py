@@ -80,7 +80,7 @@ Workflow you MUST follow:
     - Do NOT invent Slack user/channel IDs. Do NOT write <@...> mentions. Do NOT set channel/slack_user_id (leave them empty — deterministic backend logic resolves them from the admin mapping and adds the single mention).
     - Frame a message that MUST be formatted POINTWISE using clean bullet points (•) rather than a sequential paragraph.
       Structure each message cleanly as follows:
-      Hi {name}, here is a concise breakdown of the recent changes affecting your work:
+      Hi <name>, here is a concise breakdown of the recent changes affecting your work:
       • *What Changed:* <concise explanation of task.component + task.change_type + plan.summary>
       • *Affected Component:* <task.component>
       • *Why You're Notified:* <task.reason + task.impact_type + priority>
