@@ -25,6 +25,22 @@ except ImportError:
 logger = logging.getLogger("workflows.pr_workflow")
 
 
+def _safe_dump_all(value: Any) -> Any:
+    """Best-effort model_dump for prefetch payloads (lists pass through item-wise)."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [_safe_dump_all(item) for item in value]
+    try:
+        dumped = value.model_dump(mode="json")
+        return dumped
+    except Exception:
+        pass
+    if isinstance(value, dict):
+        return dict(value)
+    return value
+
+
 class PREvent(BaseModel):
     project_id: str = Field(description="Project identifier")
     owner: str = Field(description="GitHub owner/org")
@@ -574,8 +590,13 @@ class PRWorkflow:
             return existing
 
         workflow_id = f"pr:{pr_event.project_id}:{pr_event.pr_number}:{pr_event.head_sha or 'na'}"
-        commits = await self._fetch_pr_commits(pr_event)
-        project_context = await self._load_project_context(pr_event.project_id)
+        # Independent first retrievals run concurrently (neither needs the other).
+        import asyncio as _asyncio_gather
+
+        commits, project_context = await _asyncio_gather.gather(
+            self._fetch_pr_commits(pr_event),
+            self._load_project_context(pr_event.project_id),
+        )
 
         # --- Readiness gate: never run downstream PR agents until every
         # required commit is COMPLETED with a durable EnrichedChangeRecord.
@@ -620,6 +641,111 @@ class PRWorkflow:
             await self._fail_owned_dispatch(dispatch_info, str(exc))
             raise
 
+    class PrefetchError(RuntimeError):
+        """Explicit prefetch failure — reasoning must not run on incomplete evidence."""
+
+    async def _prefetch_evidence(
+        self, pr_event: PREvent, commits: List[str], project_context: ProjectContextOutput
+    ) -> dict[str, Any]:
+        """Phase 2 evidence prefetch: independent retrievals run concurrently.
+
+        Fetches enriched changes + PR files via asyncio.gather, then runs the
+        validation gate (identities, revision, schemas). Failures propagate
+        explicitly — never silent empty evidence, never mixed revisions.
+        """
+        import asyncio
+        import time
+
+        from telemetry.spans import set_span_attrs, workflow_span
+
+        repo_full = f"{pr_event.owner}/{pr_event.repository}" if pr_event.owner else pr_event.repository
+
+        async def _timed(name: str, coro) -> tuple:
+            started = time.perf_counter()
+            try:
+                result = await coro
+                return (name, result, None, (time.perf_counter() - started) * 1000.0)
+            except Exception as exc:
+                return (name, None, exc, (time.perf_counter() - started) * 1000.0)
+
+        with workflow_span(
+            "pr.prefetch",
+            {"project_id": pr_event.project_id, "pr.number": pr_event.pr_number,
+             "pr.head_sha": (pr_event.head_sha or "")[:12], "gate.required_commits": len(commits)},
+        ) as span:
+            enriched_res, files_res = await asyncio.gather(
+                _timed("enriched_changes", self._load_enriched_changes(pr_event.project_id, commits)),
+                _timed("pr_files", self.github_service.fetch_pr_files(
+                    pr_event.owner, pr_event.repository, pr_event.pr_number)),
+            )
+            failures = {name: err for (name, _, err, _) in (enriched_res, files_res) if err is not None}
+            latencies = {f"prefetch.ms.{name}": round(ms, 1) for (name, _, _, ms) in (enriched_res, files_res)}
+            if failures:
+                set_span_attrs(span, {"prefetch.ok": False, **latencies,
+                                      "prefetch.failed": sorted(failures)})
+                raise self.PrefetchError(
+                    "evidence prefetch failed: "
+                    + "; ".join(f"{name}: {err}" for name, err in failures.items())[:500]
+                )
+            enriched_changes, raw_files = enriched_res[1], files_res[1]
+            problems = self._validate_prefetch(pr_event, repo_full, set(commits or []), enriched_changes)
+            if problems:
+                set_span_attrs(span, {"prefetch.ok": False, **latencies})
+                raise self.PrefetchError("evidence validation failed: " + "; ".join(problems)[:500])
+            set_span_attrs(span, {
+                "prefetch.ok": True, **latencies,
+                "prefetch.enriched": len(enriched_changes or []),
+                "prefetch.files": len(raw_files or []),
+            })
+            return {"enriched": enriched_changes or [], "raw_files": raw_files or []}
+
+    @staticmethod
+    def _validate_prefetch(
+        pr_event: PREvent, repo_full: str, required_shas: set, enriched_changes: list
+    ) -> list[str]:
+        """Identity/revision/schema gate on prefetched evidence (present
+        records only — coverage is the readiness gate's job, already passed)."""
+        problems: list[str] = []
+        for record in enriched_changes or []:
+            sha = getattr(record, "commit_sha", "")
+            if sha and sha not in required_shas:
+                problems.append(f"foreign revision {sha[:8]} not in PR required set")
+            repo = getattr(record, "repository", "")
+            if repo and repo_full and repo != repo_full:
+                problems.append(f"repository mismatch {repo!r} != {repo_full!r}")
+            try:
+                getattr(record, "model_dump")(mode="json")
+            except Exception as exc:
+                problems.append(f"invalid enriched record {str(sha)[:8]}: {exc}"[:200])
+        return problems
+
+    async def _resolve_and_persist_canonical(
+        self, pr_event: PREvent, enriched_changes: list
+    ):
+        """Single-writer canonical resolution + Firestore persist for resume."""
+        import asyncio
+
+        from coordination.canonical import put_canonical, resolve_canonical
+
+        canonical = resolve_canonical(
+            project_id=pr_event.project_id, owner=pr_event.owner,
+            repository=pr_event.repository, pr_number=pr_event.pr_number,
+            head_sha=pr_event.head_sha or "",
+            enriched_records=[
+                r.model_dump(mode="json") if hasattr(r, "model_dump") else dict(r)
+                for r in (enriched_changes or [])
+            ],
+        )
+
+        def _sync_put() -> None:
+            try:
+                put_canonical(self.firestore_client, canonical)
+            except Exception:
+                logger.exception("Canonical persist failed for PR#%s", pr_event.pr_number)
+
+        await asyncio.to_thread(_sync_put)
+        return canonical
+
     async def _run_claimed(
         self,
         pr_event: PREvent,
@@ -628,10 +754,18 @@ class PRWorkflow:
         project_context: ProjectContextOutput,
         partial: bool,
     ) -> CommunicationBundle:
-        """Post-claim pipeline: enriched load, blast radius, agents, persist."""
+        """Post-claim pipeline: prefetch, canonical, blast radius, agents, persist."""
         from telemetry.spans import annotate_current_span
 
-        enriched_changes = await self._load_enriched_changes(pr_event.project_id, commits)
+        # Phase 2+3: concurrent prefetch, then one canonical change context.
+        prefetch = await self._prefetch_evidence(pr_event, commits, project_context)
+        enriched_changes: List[EnrichedChangeRecord] = prefetch["enriched"]
+        canonical = await self._resolve_and_persist_canonical(pr_event, enriched_changes)
+        annotate_current_span({
+            "canonical.type": canonical.change_type,
+            "canonical.component": canonical.component,
+            "canonical.status": canonical.classification_status,
+        })
         pr_input = self._build_pr_analysis_input(project_context, enriched_changes, pr_event)
 
         # Input fingerprint: any change (new head, new commits, updated context)
@@ -666,7 +800,8 @@ class PRWorkflow:
             },
         ) as _bspan:
             blast_report = await self._run_blast_radius_step(
-                pr_event, workflow_id, blast_radius_fingerprint, project_context
+                pr_event, workflow_id, blast_radius_fingerprint, project_context,
+                raw_files=prefetch["raw_files"],
             )
             _set_span_attrs(
                 _bspan,
@@ -681,12 +816,12 @@ class PRWorkflow:
         # Agents reason and persist drafts; nothing here sends Slack.
         impact_report = await self._run_step(
             "impact:analyze", pr_event, workflow_id, input_fingerprint,
-            lambda: self._run_impact_agent(pr_input, blast_report), ImpactReport,
+            lambda: self._run_impact_agent(pr_input, blast_report, canonical), ImpactReport,
         )
         self._reconcile_blast_radius(impact_report, blast_report)
         coordination_plan = await self._run_step(
             "coordination:create", pr_event, workflow_id, input_fingerprint,
-            lambda: self._run_coordinator_agent(pr_input, impact_report), CoordinationPlan,
+            lambda: self._run_coordinator_agent(pr_input, impact_report, canonical), CoordinationPlan,
         )
         # PR-level reports now (not after supervision): the supervisor's tool
         # and the UI read coordination_plans/{pr_number}. Abort if superseded.
@@ -694,11 +829,11 @@ class PRWorkflow:
             return self._stale_bundle(pr_event)
         communication_result = await self._run_step(
             "communication:generate", pr_event, workflow_id, input_fingerprint,
-            lambda: self._run_communication_agent(pr_input, coordination_plan), CommunicationResult,
+            lambda: self._run_communication_agent(pr_input, coordination_plan, canonical), CommunicationResult,
         )
         supervision = await self._run_step(
             "communication:supervise", pr_event, workflow_id, input_fingerprint,
-            lambda: self._run_supervisor_agent(pr_input, coordination_plan, communication_result, impact_report), SupervisionResult,
+            lambda: self._run_supervisor_agent(pr_input, coordination_plan, communication_result, impact_report, canonical), SupervisionResult,
         )
 
         final_messages = supervision.final_messages or communication_result.messages
@@ -706,6 +841,7 @@ class PRWorkflow:
         final_messages = await self._run_autonomy_stage(
             pr_event, workflow_id, impact_report, coordination_plan, final_messages,
             supervisor_autonomy=getattr(supervision, "autonomy", None) or [],
+            canonical=canonical,
         )
         communication_bundle = CommunicationBundle(
             project_id=pr_event.project_id,
@@ -796,6 +932,7 @@ class PRWorkflow:
         workflow_id: str,
         fingerprint: dict[str, Any],
         project_context: ProjectContextOutput,
+        raw_files: list | None = None,
     ) -> BlastRadiusReport:
         """Idempotent blast_radius:analyze step (spec: keyed by PR head SHA +
         project/context version + analysis version). Result is persisted to
@@ -805,15 +942,19 @@ class PRWorkflow:
         import asyncio
 
         async def _execute() -> BlastRadiusReport:
-            raw_files = await self.github_service.fetch_pr_files(
-                pr_event.owner, pr_event.repository, pr_event.pr_number
+            files = (
+                raw_files
+                if raw_files is not None
+                else await self.github_service.fetch_pr_files(
+                    pr_event.owner, pr_event.repository, pr_event.pr_number
+                )
             )
 
             def _sync() -> BlastRadiusReport:
-                changed_files = parse_pr_files(raw_files)
+                changed_files = parse_pr_files(files)
                 patches = {
                     str(f.get("filename")): str(f.get("patch") or "")
-                    for f in raw_files
+                    for f in files
                     if f.get("filename") and f.get("patch")
                 }
                 service = self._get_blast_radius_service()
@@ -865,7 +1006,7 @@ class PRWorkflow:
         if not impact_report.changed_components:
             impact_report.changed_components = list(blast_report.changed_components)
 
-    async def _run_impact_agent(self, pr_input: PRAnalysisInput, blast_report: Optional[BlastRadiusReport] = None) -> ImpactReport:
+    async def _run_impact_agent(self, pr_input: PRAnalysisInput, blast_report: Optional[BlastRadiusReport] = None, canonical: Any = None) -> ImpactReport:
         # Delegate to ImpactAgent - workflow does not contain prompt engineering
         agent = self.impact_agent or self._get_impact_agent()
         # For PR, we create a synthetic aggregated impact via the agent's PR-aware method if available,
@@ -879,8 +1020,14 @@ class PRWorkflow:
         first = pr_input.enriched_changes[0]
         # Ensure enriched change is persisted so tool fetch succeeds
         await self._ensure_enriched_persisted(pr_input.project_id, first)
+        prefetch = {
+            "enriched_changes": _safe_dump_all(pr_input.enriched_changes),
+            "project_context": _safe_dump_all(pr_input.project_context),
+            "blast_report": _safe_dump_all(blast_report),
+            "canonical_change": _safe_dump_all(canonical),
+        }
         report, _, _ = await self._to_thread(
-            agent.analyze, pr_input.project_id, first.commit_sha, pr_input.pr_number
+            agent.analyze, pr_input.project_id, first.commit_sha, pr_input.pr_number, prefetch
         )
         # Re-key report to PR number for persistence
         report.project_id = pr_input.project_id
@@ -888,7 +1035,7 @@ class PRWorkflow:
         return report
 
     async def _run_coordinator_agent(
-        self, pr_input: PRAnalysisInput, impact_report: ImpactReport
+        self, pr_input: PRAnalysisInput, impact_report: ImpactReport, canonical: Any = None
     ) -> CoordinationPlan:
         agent = self.coordinator_agent or self._get_coordinator_agent()
         if hasattr(agent, "analyze_pr"):
@@ -897,12 +1044,17 @@ class PRWorkflow:
         await self._ensure_impact_persisted(pr_input.project_id, impact_report)
         # Coordinator expects project_id + commit_sha; use first commit's sha as surrogate for PR
         surrogate_sha = pr_input.enriched_changes[0].commit_sha if pr_input.enriched_changes else str(pr_input.pr_number)
-        plan, _, _ = await self._to_thread(agent.analyze, pr_input.project_id, surrogate_sha)
+        prefetch = {
+            "impact_report": _safe_dump_all(impact_report),
+            "project_context": _safe_dump_all(pr_input.project_context),
+            "canonical_change": _safe_dump_all(canonical),
+        }
+        plan, _, _ = await self._to_thread(agent.analyze, pr_input.project_id, surrogate_sha, prefetch)
         plan.project_id = pr_input.project_id
         return plan
 
     async def _run_communication_agent(
-        self, pr_input: PRAnalysisInput, coordination_plan: CoordinationPlan
+        self, pr_input: PRAnalysisInput, coordination_plan: CoordinationPlan, canonical: Any = None
     ) -> CommunicationResult:
         """Draft messages only — never sends. Delivery goes through the approval endpoint."""
         agent = self.communication_agent or self._get_communication_agent()
@@ -910,7 +1062,12 @@ class PRWorkflow:
             return await agent.analyze_pr(pr_input, coordination_plan)  # type: ignore
         await self._ensure_coordination_persisted(pr_input.project_id, coordination_plan)
         surrogate_sha = pr_input.enriched_changes[0].commit_sha if pr_input.enriched_changes else str(pr_input.pr_number)
-        result = await self._to_thread(agent.analyze, pr_input.project_id, surrogate_sha)
+        prefetch = {
+            "coordination_plan": _safe_dump_all(coordination_plan),
+            "project_context": _safe_dump_all(pr_input.project_context),
+            "canonical_change": _safe_dump_all(canonical),
+        }
+        result = await self._to_thread(agent.analyze, pr_input.project_id, surrogate_sha, True, prefetch)
         if not isinstance(result, CommunicationResult):
             raise ValueError("CommunicationAgent did not return a CommunicationResult")
         return result
@@ -923,6 +1080,7 @@ class PRWorkflow:
         coordination_plan: CoordinationPlan,
         final_messages: list,
         supervisor_autonomy: list | None = None,
+        canonical: Any = None,
     ) -> list:
         """Risk-based autonomous routing (no-op unless AUTONOMY_ENABLED).
 
@@ -952,6 +1110,10 @@ class PRWorkflow:
                     for m in (final_messages or [])
                 ],
                 "impact_confidence": getattr(impact_report, "confidence", 0.0),
+                "canonical": {
+                    "type": getattr(canonical, "change_type", ""),
+                    "status": getattr(canonical, "classification_status", ""),
+                } if canonical is not None else {},
                 "policy_version": autonomy_config.POLICY_VERSION,
                 "thresholds": {
                     "min_confidence": autonomy_config.min_confidence(),
@@ -966,7 +1128,7 @@ class PRWorkflow:
                 def _sync() -> AutonomyBatch:
                     return self._evaluate_autonomy_sync(
                         pr_event, impact_report, coordination_plan, final_messages,
-                        supervisor_autonomy or [],
+                        supervisor_autonomy or [], canonical,
                     )
 
                 return await asyncio.to_thread(_sync)
@@ -1006,6 +1168,7 @@ class PRWorkflow:
         coordination_plan: CoordinationPlan,
         final_messages: list,
         supervisor_autonomy: list | None = None,
+        canonical: Any = None,
     ):
         """Synchronous batch evaluation (runs in a worker thread)."""
         from autonomy import config as autonomy_config
@@ -1038,6 +1201,7 @@ class PRWorkflow:
             project_id=pr_event.project_id, pr_number=pr_event.pr_number,
             head_sha=pr_event.head_sha or "", messages=messages,
             impact=impact_dict, plan=plan_dict,
+            canonical=_safe_dump_all(canonical),
             supervisor_autonomy=[
                 dict(s) if isinstance(s, dict) else (
                     s.model_dump(mode="json") if hasattr(s, "model_dump") else {}
@@ -1082,6 +1246,7 @@ class PRWorkflow:
         coordination_plan: CoordinationPlan,
         communication_result: CommunicationResult,
         impact_report: ImpactReport | None = None,
+        canonical: Any = None,
     ) -> SupervisionResult:
         """Supervisor critiques/validates drafts. No send capability."""
         agent = self.supervisor_agent
@@ -1102,6 +1267,9 @@ class PRWorkflow:
                         {"team": getattr(s, "team", ""), "impact_type": getattr(s, "impact_type", "")}
                         for s in (getattr(impact_report, "stakeholders", None) or [])
                     ],
+                    "canonical_change": _safe_dump_all(canonical),
+                    "project_context": _safe_dump_all(pr_input.project_context),
+                    "coordination_plan": _safe_dump_all(coordination_plan),
                 }
         except Exception:
             autonomy_context = {}

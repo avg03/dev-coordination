@@ -67,6 +67,7 @@ def test_01_low_risk_auto_send():
     try:
         decision = evaluate(
             _msg(), impact=_impact(), task=_task(), supervisor_recommendation="AUTO_SEND",
+            canonical_status="validated",
         )
         assert decision.decision == "AUTO_SEND", decision
         assert decision.risk_level == "low"
@@ -85,12 +86,12 @@ def test_02_security_sensitive_requires_human():
     try:
         decision = evaluate(
             _msg(), impact=_impact(confidence=0.99, risks=["OAuth token handling changed"]),
-            task=_task(),
+            task=_task(), canonical_status="validated",
         )
         assert decision.decision == "HUMAN_REVIEW", decision
         assert any("human approval" in r for r in decision.reasons), decision.reasons
         # Approval impact always human, regardless of confidence.
-        decision2 = evaluate(_msg(), impact=_impact(confidence=0.99), task=_task("approval", "high"))
+        decision2 = evaluate(_msg(), impact=_impact(confidence=0.99), task=_task("approval", "high"), canonical_status="validated")
         assert decision2.decision == "HUMAN_REVIEW", decision2
     finally:
         _restore(saved)
@@ -106,7 +107,7 @@ def test_03_insufficient_evidence_review():
         thin["evidence"] = []
         impact = _impact()
         impact["evidence"] = []
-        decision = evaluate(thin, impact=impact, task=_task())
+        decision = evaluate(thin, impact=impact, task=_task(), canonical_status="validated")
         assert decision.decision == "HUMAN_REVIEW", decision
     finally:
         _restore(saved)
@@ -130,6 +131,10 @@ def test_04_unmapped_blocks():
         assert decision3.decision == "BLOCK", decision3
     finally:
         _restore(saved)
+
+
+def _canonical_ok():
+    return {"classification_status": "validated", "component": "", "change_type": "fix"}
 
 
 def _executor(sender):
@@ -160,6 +165,7 @@ def test_05_duplicate_delivery_sends_once():
         kwargs = dict(
             project_id="proj-1", pr_number=7, head_sha="abc",
             messages=[_msg()], impact=_impact(), plan={"tasks": [_task()]},
+            canonical=_canonical_ok(),
             supervisor_autonomy=[{"message_id": "msg_1", "recommendation": "AUTO_SEND",
                                   "reasons": ["routine docs fix"], "risk_level": "low",
                                   "confidence": 0.95}],
@@ -198,6 +204,7 @@ def test_06_slack_failure_not_delivered():
         batch = evaluate_batch(
             project_id="proj-1", pr_number=7, head_sha="abc",
             messages=[_msg()], impact=_impact(), plan={"tasks": [_task()]},
+            canonical=_canonical_ok(),
             supervisor_autonomy=[{"message_id": "msg_1", "recommendation": "AUTO_SEND"}],
         )
         out = dispatch_auto_sends(
@@ -230,6 +237,7 @@ def test_07_dry_run_sends_nothing():
         batch = evaluate_batch(
             project_id="proj-1", pr_number=7, head_sha="abc",
             messages=[_msg()], impact=_impact(), plan={"tasks": [_task()]},
+            canonical=_canonical_ok(),
             supervisor_autonomy=[{"message_id": "msg_1", "recommendation": "AUTO_SEND"}],
             dry_run=True,
         )
@@ -280,6 +288,129 @@ def test_azure_strict_schema_typed_autonomy():
         assert field in target.get("properties", {}), field
 
 
+# 9. Missing autonomy configuration fails closed --------------------------------
+def test_09_missing_config_fail_closed():
+    from autonomy import config as aconfig
+    from autonomy.policy import evaluate
+
+    saved = _env()
+    try:
+        for k in _ENV_KEYS:
+            os.environ.pop(k, None)
+        assert aconfig.enabled() is False, "autonomy must default OFF"
+        assert aconfig.dry_run() is False
+        assert aconfig.min_confidence() == 0.8
+        # Empty everything -> fail closed (review/block/skip — never auto).
+        decision = evaluate(_msg(), impact={}, task={})
+        assert decision.decision != "AUTO_SEND", decision
+        # Canonical missing/malformed -> review.
+        decision2 = evaluate(_msg(), impact=_impact(), task=_task(),
+                             supervisor_recommendation="AUTO_SEND",
+                             canonical_status="needs_review")
+        assert decision2.decision == "HUMAN_REVIEW", decision2
+    finally:
+        _restore(saved)
+
+
+def test_09b_plan_requires_approval_flag():
+    """requires_approval=True forces review even for awareness tasks at 0.99."""
+    from autonomy.policy import evaluate
+
+    saved = _env()
+    try:
+        decision = evaluate(
+            _msg(), impact=_impact(confidence=0.99), task=_task("awareness", "low"),
+            supervisor_recommendation="AUTO_SEND",
+            requires_approval=True, canonical_status="validated",
+        )
+        assert decision.decision == "HUMAN_REVIEW", decision
+        assert any("requires approval" in r for r in decision.reasons), decision.reasons
+    finally:
+        _restore(saved)
+
+
+def test_09c_canonical_conflict_blocks_auto():
+    from autonomy.policy import evaluate
+
+    saved = _env()
+    try:
+        decision = evaluate(
+            _msg(), impact=_impact(confidence=0.99), task=_task(),
+            supervisor_recommendation="AUTO_SEND", canonical_status="conflict",
+            consistency_issues=["unresolved canonical change-type conflict — explicit review required"],
+        )
+        assert decision.decision == "HUMAN_REVIEW", decision
+    finally:
+        _restore(saved)
+
+
+def test_04b_low_confidence_default_threshold():
+    """0.75 with default 0.8 threshold -> review; explicit env override respected."""
+    from autonomy.policy import evaluate
+
+    saved = _env()
+    try:
+        decision = evaluate(
+            _msg(), impact=_impact(confidence=0.75), task=_task(),
+            supervisor_recommendation="AUTO_SEND", canonical_status="validated",
+        )
+        assert decision.decision == "HUMAN_REVIEW", decision
+    finally:
+        _restore(saved)
+
+
+def test_03b_gateway_deny_zero_sends():
+    """Gateway denial -> no Slack API call (zero sends)."""
+    from autonomy.policy import evaluate
+
+    saved = _env()
+    try:
+        decision = evaluate(
+            _msg(), impact=_impact(), task=_task(),
+            supervisor_recommendation="AUTO_SEND", canonical_status="validated",
+        )
+        assert decision.decision == "AUTO_SEND", decision
+        calls: list = []
+        ex = _executor(lambda channel, text: (calls.append(1), {"status": "sent", "ok": True})[1])
+        # No approval id -> gateway denies before sender.
+        denied = ex.execute_send("proj-1", 7, _msg(), approval_id="")
+        assert denied.status == "denied" and calls == [], (denied, calls)
+    finally:
+        _restore(saved)
+
+
+def test_01b_authorized_auto_end_to_end():
+    """0.85 low-risk + granted permissions -> gateway allows + fake sender sent."""
+    from autonomy.policy import evaluate
+    from security.gateway import PermissionGateway
+    from security.audit import InMemoryAuditSink
+    from security.identities import Action, AgentIdentity, Resource
+    from security.permissions import AuthorizationRequest
+
+    saved = _env()
+    try:
+        os.environ["AUTONOMY_MIN_CONFIDENCE"] = "0.8"  # effective default; override respected
+        decision = evaluate(
+            _msg(), impact=_impact(confidence=0.85), task=_task(),
+            supervisor_recommendation="AUTO_SEND", canonical_status="validated",
+        )
+        assert decision.decision == "AUTO_SEND", decision
+        gw = PermissionGateway(audit_sink=InMemoryAuditSink())
+        verdict = gw.authorize(AuthorizationRequest(
+            agent_id=AgentIdentity.SLACK_EXECUTOR.value, action=Action.SEND,
+            resource=Resource.SLACK, project_id="proj-1", workflow_id="pr:proj-1:7",
+            approval_id="auto:proj-1:7:msg_1", message_id="msg_1", bundle_id="7",
+            context={"channel": "C012345", "already_delivered": False},
+        ))
+        assert verdict.allowed, verdict
+        calls: list = []
+        ex = _executor(lambda channel, text: (calls.append(1), {"status": "sent", "ok": True, "ts": "9.9"})[1])
+        result = ex.execute_send("proj-1", 7, _msg(), approval_id="auto:proj-1:7:msg_1")
+        assert result.status == "sent" and result.ok and len(calls) == 1
+    finally:
+        _restore(saved)
+
+
 if __name__ == "__main__":
     test_01_low_risk_auto_send()
     test_02_security_sensitive_requires_human()
@@ -289,5 +420,11 @@ if __name__ == "__main__":
     test_06_slack_failure_not_delivered()
     test_07_dry_run_sends_nothing()
     test_08_human_approval_delivers_review_message()
+    test_09_missing_config_fail_closed()
+    test_09b_plan_requires_approval_flag()
+    test_09c_canonical_conflict_blocks_auto()
+    test_04b_low_confidence_default_threshold()
+    test_03b_gateway_deny_zero_sends()
+    test_01b_authorized_auto_end_to_end()
     test_azure_strict_schema_typed_autonomy()
     print("=== ALL AUTONOMY TESTS PASSED ===")

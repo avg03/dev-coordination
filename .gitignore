@@ -11,6 +11,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 change_record_f20bca75.json
+node_modules/
+dist/
 
 # ZCode workspace tooling
 .zcode/

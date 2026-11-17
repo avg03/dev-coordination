@@ -29,7 +29,7 @@ The guiding principle: agents reason, deterministic services execute. Webhooks, 
                                   |  webhook (HMAC verified)
                                   v
 +------------------+    +-------------------------+
-|    Streamlit     |--->|      FastAPI Backend    |
+|      React       |--->|      FastAPI Backend    |
 |  (frontend/)     |    | github_infrastructure/  |
 +------------------+    +------------+------------+
         ^        REST                |
@@ -64,7 +64,7 @@ The guiding principle: agents reason, deterministic services execute. Webhooks, 
         |                                   v
         +---- GET /prs/{n} --------- Firestore (projects, change_records, audit, idempotency)
                                     |
-                          human approval (Streamlit)
+                           human approval (React)
                                     |
                      PermissionGateway -> Idempotency -> SlackExecutor -> Slack
 ```
@@ -88,8 +88,9 @@ dev-coordination/
 │   ├── workers/                Pub/Sub consumers (commit worker, PR worker)
 │   └── workflows/              PRWorkflow orchestration (idempotent steps)
 ├── frontend/
-│   ├── streamlit_app.py        Thin presentation layer (3 pages)
-│   └── api_client.py           The only place that talks HTTP to the backend
+│   ├── src/                    React views, components, API client, and styles
+│   ├── server.mjs              Static server, runtime config, and backend proxy
+│   └── package.json            Vite build and frontend dependencies
 └── docs/                       Architecture and agent coding rules
 ```
 
@@ -240,7 +241,7 @@ PR opened/updated -> webhook -> Pub/Sub -> PRWorker
 ### Approval flow
 
 ```
-Streamlit PR Review page -> POST .../approve
+React PR Review page -> POST .../approve
    -> validate selected message ids
    -> PermissionGateway + IdempotencyManager + SlackExecutor
    -> Slack (sent, mock_sent, denied, or failed)
@@ -282,13 +283,14 @@ Re-analysis: a new head SHA changes the workflow id and every idempotency key, s
 
 ## 10. Frontend
 
-Streamlit app with three pages, all logic behind `api_client.py`:
+React dashboard with four workflows. It remains a thin client; all business logic stays in FastAPI:
 
 - Project Context: create and inspect the structured project model
 - Work Journey: commit timeline derived from enriched changes
 - PR Review: impact report, blast radius section (grouped by impact level with per-entry evidence), coordination plan, drafted messages with selection, approve / reject
+- Slack Mapping: maintain the notification channel and per-person Slack user IDs
 
-The backend URL is provided via the `BACKEND_URL` environment variable.
+The Node frontend server reads `BACKEND_URL`, proxies `/api/*` and `/health`, and exposes `PROJECT_ID` to the browser through runtime configuration. This keeps internal Docker hostnames out of browser code.
 
 ---
 
@@ -296,25 +298,158 @@ The backend URL is provided via the `BACKEND_URL` environment variable.
 
 Prerequisites: Python 3.12+, a GCP project with Firestore and Pub/Sub enabled, a GitHub token, a GitHub webhook on the target repo, and optionally a Slack bot token.
 
-```bash
+```powershell
 # Terminal 1: API + webhook receiver
 cd backend
-./venv/Scripts/python.exe -m uvicorn github_infrastructure.main:app --port 8000
+.\venv\Scripts\python.exe -m uvicorn github_infrastructure.main:app --host 0.0.0.0 --port 8000
 
 # Terminal 2: commit (push event) consumer
-./venv/Scripts/python.exe -c "from github_infrastructure.commit_worker import CommitWorker; CommitWorker().start()"
+.\venv\Scripts\python.exe -c "from github_infrastructure.commit_worker import CommitWorker; CommitWorker().start()"
 
 # Terminal 3: PR consumer
-./venv/Scripts/python.exe -c "from workers.pr_worker import PRWorker; PRWorker().start()"
+.\venv\Scripts\python.exe -c "from workers.pr_worker import PRWorker; PRWorker().start()"
 
-# Terminal 4: UI
+# Terminal 4: completion-event consumer
+.\venv\Scripts\python.exe -c "from workers.completion_consumer import CompletionConsumer; CompletionConsumer().start()"
+
+# Terminal 5: React UI
 cd ../frontend
-BACKEND_URL=http://localhost:8000 .venv2/Scripts/python.exe -m streamlit run streamlit_app.py
+npm install
+npm run dev
+
+# Terminal 6: public webhook tunnel (optional)
+ngrok http 8000
 ```
 
-For local webhook testing, expose the API with a tunnel (ngrok or cloudflared) and point the repo webhook at `https://<tunnel>/github/webhook` with events Push + Pull requests and the secret from `GITHUB_WEBHOOK_SECRET`.
+For local webhook testing, copy the HTTPS forwarding URL printed by ngrok and
+configure the GitHub webhook target as
+`https://<ngrok-host>/github/webhook`. Enable Push and Pull requests events and
+use the secret from `GITHUB_WEBHOOK_SECRET`. Keep the API running on port 8000
+while ngrok is running.
 
 Workers self-create the topic and subscriptions on first run. Pub/Sub and Slack both degrade gracefully when unconfigured.
+
+### Docker
+
+The [Dockerfile](./Dockerfile) has two targets and [compose.yaml](./compose.yaml)
+builds and runs the complete project:
+
+- `backend`: FastAPI API and GitHub webhook receiver
+- `commit-worker`: push-event consumer
+- `pr-worker`: pull-request consumer
+- `completion-consumer`: commit-completion consumer
+- `frontend`: React UI and backend proxy
+- `ngrok`: optional public webhook tunnel, enabled through the `tunnel` profile
+
+All services use one process per container. Compose waits for the backend health
+check before starting the workers and frontend.
+
+#### Build and start the complete application
+
+Run these commands from the repository root:
+
+```powershell
+docker compose build
+docker compose up -d
+docker compose ps
+```
+
+The application is then available at:
+
+| Component | URL |
+|---|---|
+| FastAPI health | http://localhost:8000/health |
+| FastAPI OpenAPI | http://localhost:8000/docs |
+| React UI | http://localhost:8501 |
+
+`backend/.env` is loaded into the backend and worker services. `frontend/.env`
+provides `PROJECT_ID`; Compose overrides `BACKEND_URL` with the internal address
+`http://backend:8000` for the frontend proxy.
+
+The backend and all three worker services receive the Langfuse variables from
+`backend/.env`: `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and optionally
+`LANGFUSE_HOST` or `LANGFUSE_BASE_URL`. A standalone `docker run` validation
+command does not receive those variables unless `--env-file backend/.env` is
+explicitly supplied; use Compose for the normal runtime.
+
+#### Start with the ngrok GitHub webhook tunnel
+
+Build and start the complete stack with the tunnel profile:
+
+```powershell
+docker compose --profile tunnel up -d --build
+docker compose ps
+```
+
+The ngrok inspector is available at http://localhost:4040. Open it to find the
+public HTTPS forwarding URL, then configure the GitHub webhook as:
+
+```text
+https://<ngrok-host>/github/webhook
+```
+
+Enable the GitHub **Push** and **Pull requests** events and use the value of
+`GITHUB_WEBHOOK_SECRET` from `backend/.env`. The tunnel forwards to the internal
+Compose service `backend:8000`; no host-side `ngrok http 8000` command is needed.
+
+This configuration does not provide or require an ngrok token. If the installed
+ngrok version requires account authentication, use the host-based command below
+with an authenticated ngrok installation, or use another tunnel such as
+Cloudflare Tunnel.
+
+If you prefer to run ngrok on the host instead of Compose, start the application
+without the profile and run:
+
+```powershell
+docker compose up -d
+ngrok http 8000
+```
+
+#### Monitor and operate the services
+
+```powershell
+# Follow all service logs
+docker compose logs -f
+
+# Follow one service
+docker compose logs -f backend
+docker compose logs -f commit-worker
+docker compose logs -f pr-worker
+docker compose logs -f completion-consumer
+docker compose logs -f frontend
+docker compose logs -f ngrok
+
+# Restart one service after configuration changes
+docker compose restart backend
+
+# Stop services but keep containers
+docker compose stop
+
+# Stop and remove containers and the Compose network
+docker compose down
+
+# Remove containers, network, and built images
+docker compose down --rmi local
+```
+
+If `GOOGLE_APPLICATION_CREDENTIALS` points to a service-account JSON file, mount
+that file into each backend/worker container read-only and set the variable to the
+container path (for example `/var/secrets/google/key.json`). Prefer Application
+Default Credentials or workload identity in managed environments. For local
+service-account authentication, add the following entries to `backend`,
+`commit-worker`, `pr-worker`, and `completion-consumer` in
+[compose.yaml](./compose.yaml):
+
+```yaml
+environment:
+  GOOGLE_APPLICATION_CREDENTIALS: /var/secrets/google/key.json
+volumes:
+  - ./backend/service-account.json:/var/secrets/google/key.json:ro
+```
+
+Replace `backend/service-account.json` with the path to your local key file.
+Never commit that file; it is excluded by [.dockerignore](./.dockerignore) and
+the repository `.gitignore`.
 
 ---
 
@@ -333,6 +468,16 @@ All secrets live in `backend/.env` (gitignored; never committed).
 | GOOGLE_API_KEY | Gemini API key for the agents |
 | SLACK_BOT_TOKEN | Slack delivery (omit for mock mode) |
 | SLACK_TEST_CHANNEL | Channel used by the live Slack test script |
+| SLACK_STRICT | `true` = raise instead of mock fallback on send failure (default false) |
+| SLACK_SEND_DELAY_SECONDS | Per-channel send pacing (default 1.0) |
+| PROVIDER | LLM provider: `google` (default) or `azure` (via LiteLLM, needs `litellm` package) |
+| AZURE_API_KEY / AZURE_API_BASE / AZURE_API_VERSION / AZURE_DEPLOYMENT | Azure OpenAI credentials + deployment (only when PROVIDER=azure) |
+| AUTONOMY_ENABLED | Risk-based auto-send master switch (default false = manual approval only) |
+| AUTONOMY_DRY_RUN | Evaluate + persist + audit autonomy without sending (default false) |
+| AUTONOMY_MIN_CONFIDENCE | Min impact confidence for AUTO_SEND (default 0.8 — requires labeled eval before relaxing) |
+| AUTONOMY_MIN_EVIDENCE | Min evidence items for AUTO_SEND (default 2) |
+| AUTONOMY_ALLOW_ACTION | Allow action-impact auto-send (default false) |
+| AUTONOMY_MAX_AUTO_PER_PR | Cap on auto-sends per PR (default 10) |
 | BACKEND_URL | Frontend to backend base URL |
 | BLAST_RADIUS_MAX_DEPTH | Dependency traversal depth (default 2) |
 
@@ -364,7 +509,7 @@ Implemented and connected:
 - All six agents with guarded tools and structured outputs
 - Permission gateway, audit logging, step-level idempotency, exactly-once Slack delivery
 - Blast Radius V1: sandboxed static analysis, dependency traversal, ownership mapping
-- Streamlit frontend for context, work journey, PR review, and approval
+- React frontend for context, work journey, PR review/approval, and Slack mapping
 
 Not yet implemented (planned):
 

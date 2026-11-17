@@ -37,11 +37,14 @@ def evaluate_batch(
     messages: list[dict[str, Any]],
     impact: dict[str, Any] | None = None,
     plan: dict[str, Any] | None = None,
+    canonical: dict[str, Any] | None = None,
     supervisor_autonomy: list[dict[str, Any]] | None = None,
     delivered_ids: set[str] | None = None,
     dry_run: bool = False,
 ) -> AutonomyBatch:
     """Deterministic per-message decisions. Never raises (fails closed)."""
+    from coordination.canonical import validate_consistency
+
     impact = impact or {}
     plan = plan or {}
     delivered_ids = delivered_ids or set()
@@ -51,6 +54,11 @@ def evaluate_batch(
         if isinstance(s, dict) and s.get("message_id")
     }
     team_tasks = tasks_by_team(plan)
+    requires_approval = bool(plan.get("requires_approval", False))
+    canonical_status = str((canonical or {}).get("classification_status", "needs_review"))
+    global_issues = validate_consistency(
+        canonical or {}, messages or [], list(team_tasks.values()),
+    )
     decisions: list[AutonomyDecision] = []
     auto_count = 0
     for raw in messages or []:
@@ -58,6 +66,10 @@ def evaluate_batch(
         mid = str(msg.get("id", "") or "")
         sup = sup_by_id.get(mid, {})
         team = str(msg.get("team", "") or "").strip().lower()
+        own_issues = [i for i in global_issues if i.startswith(f"{mid}:")]
+        shared_issues = [i for i in global_issues if not any(
+            i.startswith(f"{str(m.get('id', ''))}:") for m in messages if isinstance(m, dict)
+        )]
         decision = evaluate(
             msg,
             impact=impact,
@@ -67,6 +79,9 @@ def evaluate_batch(
             already_delivered=mid in delivered_ids,
             auto_sent_this_pr=auto_count,
             dry_run=dry_run,
+            requires_approval=requires_approval,
+            canonical_status=canonical_status,
+            consistency_issues=shared_issues + own_issues,
         )
         if decision.decision == "AUTO_SEND":
             auto_count += 1

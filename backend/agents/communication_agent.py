@@ -78,20 +78,24 @@ Workflow you MUST follow:
     - Produce exactly one SlackMessage per affected person. If only one person is affected, produce exactly one message. Never duplicate a person.
     - Set recipient to the person's stakeholder NAME and team to their TEAM. These are identity only.
     - Do NOT invent Slack user/channel IDs. Do NOT write <@...> mentions. Do NOT set channel/slack_user_id (leave them empty — deterministic backend logic resolves them from the admin mapping and adds the single mention).
-    - Frame a message that MUST include:
-      * what changed: task.component + task.change_type + plan.summary
-      * the changed component: task.component
-      * the evidence: task.evidence (source + detail) grounded from coordination plan
-      * the reason why this person is contacted: task.reason + task.impact_type + priority
-      * the required action for this person (or explicitly state none).
+    - Frame a message that MUST be formatted POINTWISE using clean bullet points (•) rather than a sequential paragraph.
+      Structure each message cleanly as follows:
+      Hi {name}, here is a concise breakdown of the recent changes affecting your work:
+      • *What Changed:* <concise explanation of task.component + task.change_type + plan.summary>
+      • *Affected Component:* <task.component>
+      • *Why You're Notified:* <task.reason + task.impact_type + priority>
+      • *Evidence:* <task.evidence (source + detail) grounded from coordination plan>
+      • *Action Required:* <specific required action for this person, or explicitly "None (FYI only)">
     - Personalize using stakeholder name, role, and team responsibilities.
     - Leave channel empty and write no <@...> mentions: the backend resolves the admin-configured Slack user ID and single channel deterministically. Invented IDs are stripped.
     - Keep the tone concise and actionable. State whether action is required (task.action_required) and the confidence.
 
 Rules:
+- Format every message POINTWISE using bullet points (•) for clean, structured readability. Never output continuous sequential paragraph text.
 - Ground every message in ProjectContext and CoordinationPlan data. Do not invent.
 - Every message must cite evidence from the task.
 - One message per affected person; never mention or duplicate additional users.
+- PREFETCHED EVIDENCE may be provided inline in the payload (coordination tasks, canonical change) — frame messages from it directly and call tools only for data absent from the payload.
 - Do not skip members that are linked to a task, even when their Slack mapping is missing (the backend flags unmapped recipients for correction).
 - Assign each SlackMessage a stable id like msg_1, msg_2, etc., in order.
 
@@ -136,7 +140,16 @@ class CommunicationAgent:
         )
 
     def _get_project_context_tool(self, project_id: str) -> dict:
-        """Read the ProjectContext from Firestore for the given project_id."""
+        """Read the ProjectContext from Firestore (prefetch cache served first)."""
+        cache = getattr(self, "_pcache", None)
+        if cache is not None:
+            cached = cache.get("project_context")
+            if cached is not None:
+                logger.info("prefetch-hit project_context for %s (no Firestore read)", project_id)
+                return {"status": "success", "project_context": cached}
+            denied = cache.charge("get_project_context")
+            if denied:
+                return {"status": "error", "error": denied}
         try:
             client = self.firestore_client
             doc = client.collection(PROJECT_CONTEXTS_COLLECTION).document(project_id).get()
@@ -151,7 +164,16 @@ class CommunicationAgent:
             return {"status": "error", "error": str(exc)}
 
     def _get_coordination_plan_tool(self, project_id: str, commit_sha: str) -> dict:
-        """Fetch the CoordinationPlan from Firestore for project_id and commit_sha."""
+        """Fetch the CoordinationPlan from Firestore (prefetch cache served first)."""
+        cache = getattr(self, "_pcache", None)
+        if cache is not None:
+            cached = cache.get("coordination_plan")
+            if cached is not None:
+                logger.info("prefetch-hit coordination_plan (no Firestore read)")
+                return {"status": "success", "coordination_plan": cached}
+            denied = cache.charge("get_coordination_plan")
+            if denied:
+                return {"status": "error", "error": denied}
         try:
             client = self.firestore_client
             # Try new collection coordination_plans, fallback to coordination_plans under projects
@@ -181,7 +203,8 @@ class CommunicationAgent:
             return {"status": "error", "error": str(exc)}
 
     def analyze(
-        self, project_id: str, commit_sha: str, dry_run: bool = True
+        self, project_id: str, commit_sha: str, dry_run: bool = True,
+        prefetch: Optional[dict[str, Any]] = None,
     ) -> CommunicationResult:
         """Pure reasoning/drafting: generate and persist drafts. NEVER sends Slack.
 
@@ -195,8 +218,13 @@ class CommunicationAgent:
 
         self._current_project_id = project_id
         self._current_commit_sha = commit_sha
+        from agents.prefetch_cache import PrefetchCache
+
+        self._pcache: PrefetchCache = PrefetchCache(prefetch)
 
         payload = {"project_id": project_id, "commit_sha": commit_sha}
+        if prefetch:
+            payload["prefetch"] = prefetch
         from telemetry.spans import track_agent_run
 
         with track_agent_run("communication_agent", {"project_id": project_id}) as t:
@@ -207,6 +235,8 @@ class CommunicationAgent:
                 {
                     "output.messages": len(getattr(result, "messages", None) or []),
                     "output.summary": str(getattr(result, "summary", "") or ""),
+                    "prefetch.hits": self._pcache.hits,
+                    "prefetch.reads": self._pcache.reads,
                 }
             )
         result.project_id = project_id

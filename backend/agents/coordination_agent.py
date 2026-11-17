@@ -92,6 +92,7 @@ Rules:
 - Do not create tasks for teams with impact_type 'none'.
 - Do not invent teams or components not present in the reports.
 - Evidence must be specific and traceable to ImpactReport.evidence or ProjectContext.
+- PREFETCHED EVIDENCE may be provided inline in the payload (impact report, project context, canonical change) — reason over it directly and call tools only for data absent from the payload.
 
 Return ONLY the CoordinationPlan JSON matching the output_schema.
 """
@@ -138,7 +139,16 @@ class CoordinationAgent:
         )
 
     def _get_impact_report_tool(self, project_id: str, commit_sha: str) -> dict:
-        """Fetch the ImpactReport from Firestore for project_id and commit_sha."""
+        """Fetch the ImpactReport from Firestore (prefetch cache served first)."""
+        cache = getattr(self, "_pcache", None)
+        if cache is not None:
+            cached = cache.get("impact_report")
+            if cached is not None:
+                logger.info("prefetch-hit impact_report (no Firestore read)")
+                return {"status": "success", "impact_report": cached}
+            denied = cache.charge("get_impact_report")
+            if denied:
+                return {"status": "error", "error": denied}
         try:
             client = self.firestore_client
             doc = (
@@ -164,7 +174,16 @@ class CoordinationAgent:
             return {"status": "error", "error": str(exc)}
 
     def _get_project_context_tool(self, project_id: str) -> dict:
-        """Read the ProjectContext from Firestore for the given project_id."""
+        """Read the ProjectContext from Firestore (prefetch cache served first)."""
+        cache = getattr(self, "_pcache", None)
+        if cache is not None:
+            cached = cache.get("project_context")
+            if cached is not None:
+                logger.info("prefetch-hit project_context for %s (no Firestore read)", project_id)
+                return {"status": "success", "project_context": cached}
+            denied = cache.charge("get_project_context")
+            if denied:
+                return {"status": "error", "error": denied}
         try:
             client = self.firestore_client
             doc = client.collection(PROJECT_CONTEXTS_COLLECTION).document(project_id).get()
@@ -179,7 +198,7 @@ class CoordinationAgent:
             return {"status": "error", "error": str(exc)}
 
     def analyze(
-        self, project_id: str, commit_sha: str
+        self, project_id: str, commit_sha: str, prefetch: Optional[dict[str, Any]] = None
     ) -> tuple[CoordinationPlan, str, bool]:
         if not project_id or not project_id.strip():
             raise ValueError("project_id cannot be empty")
@@ -193,8 +212,13 @@ class CoordinationAgent:
         # keep legacy attributes for tool
         self.saved_document_path = None
         self.saved_by_tool = False
+        from agents.prefetch_cache import PrefetchCache
+
+        self._pcache: PrefetchCache = PrefetchCache(prefetch)
 
         payload = {"project_id": project_id, "commit_sha": commit_sha}
+        if prefetch:
+            payload["prefetch"] = prefetch
         from telemetry.spans import track_agent_run
 
         with track_agent_run("coordination_agent", {"project_id": project_id}) as t:
@@ -206,6 +230,8 @@ class CoordinationAgent:
                     "output.tasks": len(getattr(plan, "tasks", None) or []),
                     "output.requires_approval": bool(getattr(plan, "requires_approval", False)),
                     "output.summary": str(getattr(plan, "summary", "") or ""),
+                    "prefetch.hits": self._pcache.hits,
+                    "prefetch.reads": self._pcache.reads,
                 }
             )
         plan.project_id = project_id

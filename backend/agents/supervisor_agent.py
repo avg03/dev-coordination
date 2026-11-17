@@ -83,16 +83,31 @@ Workflow you MUST follow:
       the same person. Slack IDs, channels and <@...> mentions are resolved
       by deterministic backend logic after you finish: never invent them and
       never add them yourself.
-    - Completeness: a message must state what changed (component + change_type),
-      why this person is contacted (reason + impact_type + priority), the
-      required action (or explicit none), and cite evidence. Revise when missing.
-   - Tone: concise and actionable.
+    - Format & Completeness: a message must be formatted POINTWISE using clean
+      bullet points (•) rather than sequential paragraphs. It must state what
+      changed (component + change_type), why this person is contacted (reason +
+      impact_type + priority), the required action (or explicit none), and
+      cite evidence. Revise if missing or if written as a sequential wall of text.
+    - Canonical consistency: the payload's autonomy_context.canonical_change is
+      the single validated classification ({component, change_type}) for this
+      PR revision. Every final message must be SEMANTICALLY consistent with it:
+      a `fix` may be worded "corrected the authorization check" without using
+      the word "fix", as long as it describes the same behavioral change on
+      the same component. It must NOT be described as a refactor, feature, or
+      any materially different change. Component/domain (auth), change type
+      (fix), impact type (awareness/action/approval), and risk are distinct
+      axes: a security-sensitive fix is still a fix — never relabel it, and
+      never treat security relevance as low-risk. If the evidence is genuinely
+      ambiguous between two readings, mark the ambiguity in the message and
+      recommend HUMAN_REVIEW rather than inventing certainty.
+    - Tone: concise and actionable.
 4. Produce a SupervisionResult:
    - verdicts: one per draft message (keep/revise/reject) with a grounded reason.
     - final_messages: the messages to deliver — kept drafts unchanged, revised
-      drafts in revised form, and NO rejected messages. Keep ids stable
-      (msg_1, msg_2, ...). Every final message keeps recipient and team;
-      leave channel/slack_user_id empty and write no mentions.
+      drafts in revised form (always maintaining clean pointwise bullet format),
+      and NO rejected messages. Keep ids stable (msg_1, msg_2, ...). Every final
+      message keeps recipient and team; leave channel/slack_user_id empty and
+      write no mentions.
     - summary + confidence grounded in your review.
 4b. For EACH final message, add an autonomy advisory entry
     {message_id, recommendation, reasons, risk_level, confidence} where
@@ -110,6 +125,11 @@ Workflow you MUST follow:
 Rules:
 - Never invent new recipients, channels or evidence.
 - Do not remove a message unless it fails grounding or recipient validation.
+- Do not rigidly demand the canonical words: natural, context-sensitive wording
+  is welcome when semantically consistent; reject only material contradictions.
+- Deterministic backend checks re-verify component, recipient, channel, Slack
+  user ID, required action, and risk agreement after you finish — unresolved
+  material contradictions block autonomous delivery regardless of recommendation.
 - Return ONLY the SupervisionResult JSON matching the output_schema.
 """
 
@@ -157,7 +177,16 @@ class SupervisorAgent:
         )
 
     def _get_project_context_tool(self, project_id: str) -> dict:
-        """Read the ProjectContext from Firestore for the given project_id."""
+        """Read the ProjectContext from Firestore (prefetch cache served first)."""
+        cache = getattr(self, "_pcache", None)
+        if cache is not None:
+            cached = cache.get("project_context")
+            if cached is not None:
+                logger.info("prefetch-hit project_context for %s (no Firestore read)", project_id)
+                return {"status": "success", "project_context": cached}
+            denied = cache.charge("get_project_context")
+            if denied:
+                return {"status": "error", "error": denied}
         try:
             client = self.firestore_client
             doc = client.collection(PROJECT_CONTEXTS_COLLECTION).document(project_id).get()
@@ -172,7 +201,16 @@ class SupervisorAgent:
             return {"status": "error", "error": str(exc)}
 
     def _get_coordination_plan_tool(self, project_id: str, pr_number: int) -> dict:
-        """Fetch the PR-level CoordinationPlan from Firestore."""
+        """Fetch the PR-level CoordinationPlan from Firestore (prefetch cache served first)."""
+        cache = getattr(self, "_pcache", None)
+        if cache is not None:
+            cached = cache.get("coordination_plan")
+            if cached is not None:
+                logger.info("prefetch-hit coordination_plan for PR#%s (no Firestore read)", pr_number)
+                return {"status": "success", "coordination_plan": cached}
+            denied = cache.charge("get_coordination_plan")
+            if denied:
+                return {"status": "error", "error": denied}
         try:
             client = self.firestore_client
             doc = (
@@ -238,6 +276,9 @@ class SupervisorAgent:
         self._current_pr_number = pr_number
         self.saved_document_path = None
         self.saved_by_tool = False
+        from agents.prefetch_cache import PrefetchCache
+
+        self._pcache: PrefetchCache = PrefetchCache(autonomy_context)
 
         payload = {
             "project_id": project_id,
@@ -259,6 +300,8 @@ class SupervisorAgent:
                     "output.final_messages": len(getattr(result, "final_messages", None) or []),
                     "output.summary": str(getattr(result, "summary", "") or ""),
                     "output.autonomy_advisories": len(getattr(result, "autonomy", None) or []),
+                    "prefetch.hits": self._pcache.hits,
+                    "prefetch.reads": self._pcache.reads,
                 }
             )
         result.project_id = project_id

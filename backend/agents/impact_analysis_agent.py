@@ -96,6 +96,7 @@ Rules:
 - Every stakeholder, workflow, and risk inference must include evidence.
 - Ground all inferences in ProjectContext, EnrichedChangeRecord (changed_files, patches, functions, summary, behavior_before/after), and the BlastRadiusReport when available.
 - Do not invent teams, components, people, or dependencies not present in the evidence.
+- PREFETCHED EVIDENCE may be provided inline in the payload (enriched change, project context, blast radius, canonical change) — reason over it directly and call tools only for data absent from the payload.
 - After generating the ImpactReport, you MUST call save_impact_report with project_id and the complete report, then return the same JSON as final output.
 
 Return ONLY the ImpactReport JSON matching the output_schema.
@@ -151,7 +152,16 @@ class ImpactAnalysisAgent:
         )
 
     def _get_project_context_tool(self, project_id: str) -> dict:
-        """Read the ProjectContext from Firestore for the given project_id."""
+        """Read the ProjectContext from Firestore (prefetch cache served first)."""
+        cache = getattr(self, "_pcache", None)
+        if cache is not None:
+            cached = cache.get("project_context")
+            if cached is not None:
+                logger.info("prefetch-hit project_context for %s (no Firestore read)", project_id)
+                return {"status": "success", "project_context": cached}
+            denied = cache.charge("get_project_context")
+            if denied:
+                return {"status": "error", "error": denied}
         try:
             client = self.firestore_client
             doc = client.collection(PROJECT_CONTEXTS_COLLECTION).document(project_id).get()
@@ -166,7 +176,16 @@ class ImpactAnalysisAgent:
             return {"status": "error", "error": str(exc)}
 
     def _get_enriched_change_tool(self, project_id: str, commit_sha: str) -> dict:
-        """Read the EnrichedChangeRecord from Firestore for project_id and commit_sha."""
+        """Read the EnrichedChangeRecord from Firestore (prefetch cache served first)."""
+        cache = getattr(self, "_pcache", None)
+        if cache is not None:
+            cached = cache.find_enriched(commit_sha)
+            if cached is not None:
+                logger.info("prefetch-hit enriched_change %s (no Firestore read)", commit_sha[:8])
+                return {"status": "success", "enriched_change": cached}
+            denied = cache.charge("get_enriched_change")
+            if denied:
+                return {"status": "error", "error": denied}
         try:
             client = self.firestore_client
             doc = (
@@ -195,8 +214,17 @@ class ImpactAnalysisAgent:
         """Read-only access to the deterministic BlastRadiusReport for the PR.
 
         The Impact Agent gets the generated evidence/graph — never sandbox or
-        repository execution permissions.
+        repository execution permissions. Prefetch cache served first.
         """
+        cache = getattr(self, "_pcache", None)
+        if cache is not None:
+            cached = cache.get("blast_report")
+            if cached is not None:
+                logger.info("prefetch-hit blast_radius for PR#%s (no Firestore read)", pr_number)
+                return {"status": "success", "blast_radius_report": cached}
+            denied = cache.charge("get_blast_radius")
+            if denied:
+                return {"status": "error", "error": denied}
         try:
             client = self.firestore_client
             doc = (
@@ -248,7 +276,8 @@ class ImpactAnalysisAgent:
             return {"status": "error", "error": str(exc)}
 
     def analyze(
-        self, project_id: str, commit_sha: str, pr_number: Optional[int] = None
+        self, project_id: str, commit_sha: str, pr_number: Optional[int] = None,
+        prefetch: Optional[dict[str, Any]] = None,
     ) -> tuple[ImpactReport, str, bool]:
         if not project_id or not project_id.strip():
             raise ValueError("project_id cannot be empty")
@@ -260,10 +289,15 @@ class ImpactAnalysisAgent:
         self._current_pr_number = pr_number or 0
         self.saved_document_path = None
         self.saved_by_tool = False
+        from agents.prefetch_cache import PrefetchCache
+
+        self._pcache: PrefetchCache = PrefetchCache(prefetch)
 
         payload = {"project_id": project_id, "commit_sha": commit_sha}
         if pr_number:
             payload["pr_number"] = pr_number
+        if prefetch:
+            payload["prefetch"] = prefetch
         from telemetry.spans import track_agent_run
 
         with track_agent_run(
@@ -279,6 +313,8 @@ class ImpactAnalysisAgent:
                     "output.affected_count": len(getattr(report, "affected_components", None) or []),
                     "output.stakeholders": len(getattr(report, "stakeholders", None) or []),
                     "output.confidence": float(getattr(report, "confidence", 0.0) or 0.0),
+                    "prefetch.hits": self._pcache.hits,
+                    "prefetch.reads": self._pcache.reads,
                 }
             )
 

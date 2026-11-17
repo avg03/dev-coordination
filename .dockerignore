@@ -1,0 +1,30 @@
+# Never send credentials or environment files to the Docker daemon.
+.env
+**/.env
+*.json
+
+# Local Python environments are large, platform-specific, and not reproducible.
+.venv/
+venv/
+**/.venv*/
+**/venv/
+env/
+
+# Python-generated files and test caches are not runtime inputs.
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Keep local editor and workspace metadata out of the image context.
+.git/
+.gitignore
+.zcode/
+.vscode/
+
+# Documentation and offline tests are not needed in runtime images.
+docs/
+backend/tests/
+README.md

@@ -1,0 +1,102 @@
+# Compose creates one isolated service for each long-running project process.
+name: dev-coordination
+
+services:
+  # FastAPI API and GitHub webhook receiver.
+  backend:
+    build:
+      context: .
+      target: backend
+    image: dev-coordination-backend:latest
+    env_file:
+      - ./backend/.env
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  # Consumes push events and creates durable commit records.
+  commit-worker:
+    build:
+      context: .
+      target: backend
+    image: dev-coordination-backend:latest
+    env_file:
+      - ./backend/.env
+    command:
+      - python
+      - -c
+      - "from github_infrastructure.commit_worker import CommitWorker; CommitWorker().start()"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # Consumes pull-request events and runs the PR workflow.
+  pr-worker:
+    build:
+      context: .
+      target: backend
+    image: dev-coordination-backend:latest
+    env_file:
+      - ./backend/.env
+    command:
+      - python
+      - -c
+      - "from workers.pr_worker import PRWorker; PRWorker().start()"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # Resumes PR workflows after required commits finish processing.
+  completion-consumer:
+    build:
+      context: .
+      target: backend
+    image: dev-coordination-backend:latest
+    env_file:
+      - ./backend/.env
+    command:
+      - python
+      - -c
+      - "from workers.completion_consumer import CompletionConsumer; CompletionConsumer().start()"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # React presentation layer; its Node server proxies calls over the Compose network.
+  frontend:
+    build:
+      context: .
+      target: frontend
+    image: dev-coordination-frontend:latest
+    env_file:
+      - frontend/.env
+    environment:
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # Optional public tunnel for GitHub webhooks; start with --profile tunnel.
+  ngrok:
+    image: ngrok/ngrok:latest
+    profiles:
+      - tunnel
+    command:
+      - http
+      - backend:8000
+    ports:
+      - "4040:4040"
+    depends_on:
+      backend:
+        condition: service_healthy

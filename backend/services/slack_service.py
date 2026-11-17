@@ -18,6 +18,16 @@ def _read_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def _strict_slack() -> bool:
+    """SLACK_STRICT=true: raise instead of mock fallback.
+
+    Default false preserves local-dev behavior (mock with fallback_error).
+    Production should set true so a credential/scope/channel failure is loud
+    instead of a silent mock marked ok=True.
+    """
+    return _read_env("SLACK_STRICT", "").strip().lower() in ("true", "1", "yes", "on")
+
+
 SLACK_BOT_TOKEN = _read_env("SLACK_BOT_TOKEN", "")
 SLACK_SIGNING_SECRET = _read_env("SLACK_SIGNING_SECRET", "")
 
@@ -47,10 +57,14 @@ def send_slack_message(
     """
     if not channel:
         logger.warning("No channel provided, mock fallback")
+        if _strict_slack():
+            raise ValueError("No Slack channel provided (SLACK_STRICT: refusing mock fallback)")
         return {"status": "mock_sent", "channel": channel, "ok": True, "mock": True}
 
     client = _get_client()
     if client is None:
+        if _strict_slack():
+            raise RuntimeError("No SLACK_BOT_TOKEN or slack_sdk missing (SLACK_STRICT: refusing mock fallback)")
         logger.info("[MOCK SLACK] %s: %s", channel, text[:120].replace("\n", " "))
         return {"status": "mock_sent", "channel": channel, "ok": True, "mock": True, "text_preview": text[:120]}
 
@@ -68,6 +82,8 @@ def send_slack_message(
         return {"status": "error", "channel": channel, "ok": False, "error": str(resp)}
     except Exception as exc:
         logger.exception("Slack send failed for %s, falling back to mock: %s", channel, exc)
+        if _strict_slack():
+            raise
         return {
             "status": "mock_sent",
             "channel": channel,

@@ -42,6 +42,9 @@ def evaluate(
     already_delivered: bool = False,
     auto_sent_this_pr: int = 0,
     dry_run: bool = False,
+    requires_approval: bool = False,
+    canonical_status: str = "needs_review",
+    consistency_issues: list[str] | None = None,
 ) -> AutonomyDecision:
     """Evaluate one resolved SlackMessage. Never raises (fails to HUMAN_REVIEW)."""
     impact = impact or {}
@@ -56,6 +59,9 @@ def evaluate(
             already_delivered=already_delivered,
             auto_sent_this_pr=auto_sent_this_pr,
             dry_run=dry_run, reasons=reasons,
+            requires_approval=requires_approval,
+            canonical_status=canonical_status,
+            consistency_issues=consistency_issues or [],
         )
     except Exception as exc:  # never block the pipeline on policy bugs
         logger.exception("Autonomy policy failed for %s", mid)
@@ -69,7 +75,8 @@ def evaluate(
 
 def _evaluate(message, *, impact, task, supervisor_recommendation,
               supervisor_reasons, already_delivered, auto_sent_this_pr,
-              dry_run, reasons) -> AutonomyDecision:
+              dry_run, reasons, requires_approval, canonical_status,
+              consistency_issues) -> AutonomyDecision:
     mid = str(message.get("id", "") or "")
     sup_rec = supervisor_recommendation if supervisor_recommendation in _ORDER else "HUMAN_REVIEW"
 
@@ -78,9 +85,6 @@ def _evaluate(message, *, impact, task, supervisor_recommendation,
         all_reasons = list(extra)
         if final != decision:
             all_reasons.append(f"supervisor recommended {sup_rec} (more restrictive)")
-        elif sup_rec != "AUTO_SEND" and decision == "AUTO_SEND":
-            all_reasons.append(f"supervisor concurred ({sup_rec})" if sup_rec == "HUMAN_REVIEW" else "")
-            all_reasons = [r for r in all_reasons if r]
         if supervisor_reasons and final != "AUTO_SEND":
             all_reasons.extend([f"supervisor: {r}"[:300] for r in supervisor_reasons[:3]])
         return AutonomyDecision(
@@ -125,6 +129,16 @@ def _evaluate(message, *, impact, task, supervisor_recommendation,
         return decide("HUMAN_REVIEW", "high", [f"security-sensitive keyword {hit!r} — human approval required"])
     if impact_type == "approval":
         return decide("HUMAN_REVIEW", "high", ["approval impact — human sign-off required regardless of confidence"])
+    if requires_approval:
+        return decide("HUMAN_REVIEW", "high", ["coordination plan requires approval — human sign-off required"])
+    if canonical_status == "conflict":
+        return decide("HUMAN_REVIEW", "high", ["unresolved canonical change-type conflict — explicit review required"])
+    if canonical_status != "validated":
+        return decide("HUMAN_REVIEW", "medium", [f"canonical context {canonical_status} — autonomous delivery blocked"])
+    if consistency_issues:
+        first = str(consistency_issues[0])[:200]
+        extra = f" (+{len(consistency_issues) - 1} more)" if len(consistency_issues) > 1 else ""
+        return decide("HUMAN_REVIEW", "high", [f"consistency check failed: {first}{extra}"])
     if str(task.get("priority", "") or "").strip().lower() == "critical":
         return decide("HUMAN_REVIEW", "high", ["critical priority — human approval required"])
 
