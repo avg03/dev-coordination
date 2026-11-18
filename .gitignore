@@ -1,21 +1,42 @@
-# Created by venv; see https://docs.python.org/3/library/venv.html
-
+# Environments & Secrets
 venv/
 .venv/
 .venv2/
 env/
 .env/
 .env
-/backend/golden-furnace-369010-6b22d942562a.json
+.env.*
+*.env
+*.env.local
+*.env.development
+*.env.production
+
+# Service account credentials & keys (defensive globbing)
+*service-account*.json
+*credentials*.json
+backend/*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+
+# Python artifacts & caches
 __pycache__/
 *.py[cod]
 *$py.class
-change_record_f20bca75.json
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node & Frontend builds
 node_modules/
 dist/
 
-# ZCode workspace tooling
+# Local workspace & editor tooling
 .zcode/
+.vscode/
+.idea/
 
 # Blast radius sandbox workspaces (defensive — they live in system temp)
 blast-radius-*/

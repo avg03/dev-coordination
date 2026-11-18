@@ -47,7 +47,7 @@ def test_secret_files_denied():
         "keys/server.key",
         "id_rsa",
         "deploy/id_ed25519",
-        "golden-furnace-service-account.json",
+        "mock-service-account.json",
         "credentials.json",
         ".git/config",
         ".ssh/known_hosts",

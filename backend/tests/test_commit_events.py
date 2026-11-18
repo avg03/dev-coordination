@@ -52,7 +52,7 @@ ENVELOPE = {
 def test_decode_base64_pull_item():
     encoded = base64.b64encode(json.dumps(ENVELOPE).encode()).decode()
     pull_item = {
-        "subscription": "projects/golden-furnace-369010/subscriptions/github-webhook-events-sub",
+        "subscription": "projects/demo-gcp-project/subscriptions/github-webhook-events-sub",
         "message": {
             "data": encoded,
             "messageId": "1",

@@ -43,4 +43,4 @@ createServer(async (req, res) => {
   if (!file.startsWith(root) || !existsSync(file) || statSync(file).isDirectory()) file = join(root, 'index.html')
   res.writeHead(200, { 'content-type': types[extname(file)] || 'application/octet-stream' })
   createReadStream(file).pipe(res)
-}).listen(port, '0.0.0.0', () => console.log(`Change Coordinator UI listening on ${port}`))
+}).listen(port, '0.0.0.0', () => console.log(`Dev-Coordination UI listening on ${port}`))
