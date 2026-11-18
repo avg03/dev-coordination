@@ -45,6 +45,30 @@ class CommitTimelineResponse(BaseModel):
     commits: list[CommitTimelineItem] = Field(default_factory=list, description="Ordered commit timeline")
 
 
+class LatestPRResponse(BaseModel):
+    has_pr: bool = Field(default=False, description="Whether any PR review exists")
+    pr_number: Optional[int] = Field(default=None, description="Latest PR number")
+    head_sha: Optional[str] = Field(default=None, description="Commit SHA of PR head")
+    persisted_at: Optional[str] = Field(default=None, description="Timestamp when review was saved")
+    approved: Optional[bool] = Field(default=None, description="Whether Slack delivery was approved")
+    delivery_status: Optional[str] = Field(default=None, description="Current delivery status (e.g. pending, completed, rejected)")
+    requires_action: bool = Field(default=False, description="Whether this PR is awaiting review and approval")
+    message_count: int = Field(default=0, description="Number of Slack messages in the bundle")
+
+
+class PRSummaryItem(BaseModel):
+    pr_number: int = Field(description="Pull request number")
+    head_sha: Optional[str] = Field(default=None, description="Commit SHA of PR head")
+    persisted_at: Optional[str] = Field(default=None, description="Timestamp when review was saved")
+    approved: Optional[bool] = Field(default=None, description="Whether Slack delivery was approved")
+    delivery_status: Optional[str] = Field(default=None, description="Current delivery status")
+    message_count: int = Field(default=0, description="Number of Slack messages in the bundle")
+
+
+class PRListResponse(BaseModel):
+    prs: list[PRSummaryItem] = Field(default_factory=list, description="List of PR reviews")
+
+
 class PRReviewResponse(BaseModel):
     project_id: str = Field(description="Project identifier")
     pr_number: int = Field(description="Pull request number")
@@ -180,6 +204,135 @@ def get_commit_timeline(
         )
 
     return CommitTimelineResponse(commits=commits)
+
+
+@router.get(
+    "/{project_id}/prs/latest",
+    response_model=LatestPRResponse,
+    summary="Get latest PR review status for notification listener",
+)
+def get_latest_pr_review(
+    project_id: str,
+    client=Depends(get_firestore_client),
+) -> LatestPRResponse:
+    if not project_id or not project_id.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="project_id cannot be empty")
+
+    base = client.collection("projects").document(project_id)
+    try:
+        docs = list(base.collection("communications").stream())
+    except Exception as exc:
+        logger.exception("Failed to query communications collection for %s", project_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to query PR communications",
+        ) from exc
+
+    if not docs:
+        return LatestPRResponse(has_pr=False)
+
+    candidates: list[dict] = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        raw_pr = data.get("pr_number")
+        pr_num = None
+        if raw_pr is not None:
+            try:
+                pr_num = int(raw_pr)
+            except (ValueError, TypeError):
+                pass
+        if pr_num is None:
+            try:
+                pr_num = int(doc.id)
+            except (ValueError, TypeError):
+                continue
+
+        persisted_at = str(data.get("persisted_at") or data.get("created_at") or "")
+        approved = data.get("approved")
+        delivery_status = data.get("delivery_status")
+        raw_msgs = data.get("messages") or []
+
+        candidates.append({
+            "pr_number": pr_num,
+            "head_sha": data.get("head_sha"),
+            "persisted_at": persisted_at,
+            "approved": approved,
+            "delivery_status": delivery_status,
+            "message_count": len(raw_msgs),
+        })
+
+    if not candidates:
+        return LatestPRResponse(has_pr=False)
+
+    # Sort descending by persisted_at, then pr_number
+    candidates.sort(key=lambda c: (c["persisted_at"], c["pr_number"]), reverse=True)
+    latest = candidates[0]
+
+    is_done = (latest["approved"] is True) or (latest["delivery_status"] in ["completed", "sent", "rejected"])
+
+    return LatestPRResponse(
+        has_pr=True,
+        pr_number=latest["pr_number"],
+        head_sha=latest["head_sha"],
+        persisted_at=latest["persisted_at"],
+        approved=latest["approved"],
+        delivery_status=latest["delivery_status"],
+        requires_action=not is_done,
+        message_count=latest["message_count"],
+    )
+
+
+@router.get(
+    "/{project_id}/prs",
+    response_model=PRListResponse,
+    summary="List PR reviews for project",
+)
+def list_pr_reviews(
+    project_id: str,
+    client=Depends(get_firestore_client),
+) -> PRListResponse:
+    if not project_id or not project_id.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="project_id cannot be empty")
+
+    base = client.collection("projects").document(project_id)
+    try:
+        docs = list(base.collection("communications").stream())
+    except Exception as exc:
+        logger.exception("Failed to query communications collection for %s", project_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to query PR communications",
+        ) from exc
+
+    items: list[PRSummaryItem] = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        raw_pr = data.get("pr_number")
+        pr_num = None
+        if raw_pr is not None:
+            try:
+                pr_num = int(raw_pr)
+            except (ValueError, TypeError):
+                pass
+        if pr_num is None:
+            try:
+                pr_num = int(doc.id)
+            except (ValueError, TypeError):
+                continue
+
+        items.append(
+            PRSummaryItem(
+                pr_number=pr_num,
+                head_sha=data.get("head_sha"),
+                persisted_at=str(data.get("persisted_at") or data.get("created_at") or ""),
+                approved=data.get("approved"),
+                delivery_status=data.get("delivery_status"),
+                message_count=len(data.get("messages") or []),
+            )
+        )
+
+    items.sort(key=lambda x: (x.persisted_at or "", x.pr_number), reverse=True)
+    return PRListResponse(prs=items)
 
 
 @router.get(

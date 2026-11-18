@@ -14,6 +14,7 @@ from typing import Any
 from . import config as aconfig
 from .models import AutonomyBatch, AutonomyDecision
 from .policy import evaluate
+from services.decision_service import DecisionService
 
 logger = logging.getLogger("autonomy.runner")
 
@@ -41,6 +42,7 @@ def evaluate_batch(
     supervisor_autonomy: list[dict[str, Any]] | None = None,
     delivered_ids: set[str] | None = None,
     dry_run: bool = False,
+    decision_service: Any = None,
 ) -> AutonomyBatch:
     """Deterministic per-message decisions. Never raises (fails closed)."""
     from coordination.canonical import validate_consistency
@@ -59,6 +61,14 @@ def evaluate_batch(
     global_issues = validate_consistency(
         canonical or {}, messages or [], list(team_tasks.values()),
     )
+
+    dm_service = None
+    if decision_service is not None or aconfig.decision_model_enabled():
+        try:
+            dm_service = decision_service or DecisionService()
+        except Exception:
+            logger.exception("Failed to initialize DecisionService")
+
     decisions: list[AutonomyDecision] = []
     auto_count = 0
     for raw in messages or []:
@@ -66,14 +76,47 @@ def evaluate_batch(
         mid = str(msg.get("id", "") or "")
         sup = sup_by_id.get(mid, {})
         team = str(msg.get("team", "") or "").strip().lower()
+        task_dict = team_tasks.get(team, {})
         own_issues = [i for i in global_issues if i.startswith(f"{mid}:")]
         shared_issues = [i for i in global_issues if not any(
             i.startswith(f"{str(m.get('id', ''))}:") for m in messages if isinstance(m, dict)
         )]
+
+        decision_res = None
+        if dm_service is not None and dm_service.is_configured:
+            msg_context = {
+                "pr_summary": plan.get("summary") or impact.get("summary") or "",
+                "affected_components": impact.get("affected_components", []),
+                "impact_type": task_dict.get("impact_type") or msg.get("impact_type", "awareness"),
+                "change_risk": impact.get("risk_level", "medium"),
+                "notification_only": (task_dict.get("impact_type") or msg.get("impact_type")) != "approval",
+            }
+            sup_assessment = {
+                "message_intent": "routine_coordination" if msg.get("impact_type") in ("action", "approval") else "awareness",
+                "action_burden": "high" if str(task_dict.get("priority", "")).lower() == "critical" else "low",
+                "creates_new_commitment": False,
+                "claims_organizational_authority": False,
+                "evidence_quality": "grounded" if bool(msg.get("evidence")) else "sparse",
+                "communication_consequence": "low" if sup.get("risk_level") == "low" else "moderate",
+            }
+            trusted_context = {
+                "recipient_authorized": not bool(msg.get("unmapped")) and bool(msg.get("slack_user_id")),
+                "channel_authorized": bool(msg.get("channel")),
+                "existing_responsibility": True,
+                "routine_review_request_allowed": True,
+                "contains_prohibited_secrets": False,
+            }
+            decision_res = dm_service.evaluate_message(
+                msg,
+                message_context=msg_context,
+                supervisor_assessment=sup_assessment,
+                trusted_policy_context=trusted_context,
+            )
+
         decision = evaluate(
             msg,
             impact=impact,
-            task=team_tasks.get(team, {}),
+            task=task_dict,
             supervisor_recommendation=str(sup.get("recommendation", "HUMAN_REVIEW") or "HUMAN_REVIEW"),
             supervisor_reasons=list(sup.get("reasons", []) or []),
             already_delivered=mid in delivered_ids,
@@ -82,6 +125,8 @@ def evaluate_batch(
             requires_approval=requires_approval,
             canonical_status=canonical_status,
             consistency_issues=shared_issues + own_issues,
+            decision_result=decision_res,
+            shadow_mode=aconfig.decision_shadow_mode(),
         )
         if decision.decision == "AUTO_SEND":
             auto_count += 1

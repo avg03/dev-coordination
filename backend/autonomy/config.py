@@ -64,6 +64,31 @@ def max_auto_per_pr() -> int:
     return _int("AUTONOMY_MAX_AUTO_PER_PR", 10)
 
 
+def decision_model_enabled() -> bool:
+    return _flag("DECISION_MODEL_ENABLED", False)
+
+
+def decision_provider() -> str:
+    return os.getenv("DECISION_PROVIDER", "microsoft").strip().lower()
+
+
+def decision_foundry_endpoint() -> str:
+    endpoint = os.getenv("DECISION_FOUNDRY_ENDPOINT") or os.getenv("AZURE_API_BASE", "")
+    return endpoint.strip().rstrip("/")
+
+
+def decision_model_deployment() -> str:
+    return os.getenv("DECISION_MODEL_DEPLOYMENT", "Decision-1.1").strip()
+
+
+def decision_api_key() -> str:
+    return os.getenv("DECISION_API_KEY") or os.getenv("AZURE_API_KEY", "")
+
+
+def decision_shadow_mode() -> bool:
+    return _flag("DECISION_SHADOW_MODE", False)
+
+
 POLICY_VERSION = "v1"
 
 # Case-insensitive substrings forcing HUMAN_REVIEW regardless of confidence.

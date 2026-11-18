@@ -7,7 +7,7 @@ advisory and can only be downgraded, never upgraded.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -26,6 +26,29 @@ class MessageAutonomy(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
+class AutonomyDecisionResult(BaseModel):
+    """Normalized application model for Microsoft Decision-1.1 System One output."""
+
+    message_id: str
+    message_intent: str = "unclear"
+    creates_unapproved_commitment: bool | None = None
+    communication_consequence_score: float | None = None
+
+    recommended_decision: Literal[
+        "AUTO_SEND",
+        "HUMAN_REVIEW",
+        "BLOCK",
+        "SKIP"
+    ] = "HUMAN_REVIEW"
+
+    decision_probability: float | None = None
+    option_probabilities: dict[str, float] | None = None
+
+    provider: str = "microsoft"
+    model: str = "Decision-1.1"
+    reason_code: str = "default_fallback"
+
+
 class AutonomyDecision(BaseModel):
     """Final deterministic decision for one message (persisted + audited)."""
 
@@ -38,6 +61,8 @@ class AutonomyDecision(BaseModel):
     supervisor_recommendation: str = "HUMAN_REVIEW"
     policy_version: str = "v1"
     dry_run: bool = False
+    decision_model_result: Optional[AutonomyDecisionResult] = None
+    shadow_mode: bool = False
 
 
 class AutonomyBatch(BaseModel):

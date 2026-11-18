@@ -27,6 +27,8 @@ export const api = {
   health: signal => request('GET', '/health', null, signal),
   createContext: description => request('POST', '/api/projects/context', { project_id: projectId, project_description: description }),
   commits: limit => request('GET', `/api/projects/${encodeURIComponent(projectId)}/commits${limit ? `?limit=${limit}` : ''}`),
+  latestPr: () => request('GET', `/api/projects/${encodeURIComponent(projectId)}/prs/latest`),
+  listPrs: () => request('GET', `/api/projects/${encodeURIComponent(projectId)}/prs`),
   prReview: number => request('GET', `/api/projects/${encodeURIComponent(projectId)}/prs/${number}`),
   approve: (number, approved, selected_messages) => request('POST', `/api/projects/${encodeURIComponent(projectId)}/prs/${number}/approve`, { approved, selected_messages }),
   context: () => request('GET', `/api/projects/${encodeURIComponent(projectId)}/context`),

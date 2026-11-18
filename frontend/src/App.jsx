@@ -70,12 +70,51 @@ function Commit({ item }) {
   return <details className="timeline-item"><summary><span className="timeline-node"><GitCommitHorizontal aria-hidden="true"/></span><div><div className="summary-title"><code>{shortSha(sha)}</code><strong>{item.summary || item.commit_message || item.message || 'No summary'}</strong></div><div className="summary-meta"><span><Clock3 aria-hidden="true"/>{fmtTime(item.timestamp || item.saved_at)}</span>{components.slice(0, 3).map(c => <Badge key={c}>{c}</Badge>)}</div></div><ChevronDown className="chevron" aria-hidden="true"/></summary><div className="timeline-body"><div className="metadata-grid"><span><small>Full SHA</small><code>{sha || '—'}</code></span><span><small>Author</small>{item.author || item.author_name || '—'}</span><span><small>Branch</small><code>{item.branch || '—'}</code></span><span><small>Change type</small>{item.change_type || '—'}</span></div>{item.summary && <p>{item.summary}</p>}{files.length > 0 && <div><h3>Changed files</h3><ul className="file-list">{files.map((f, i) => <li key={f.path || f.filename || i}><FileCode2 aria-hidden="true"/><code>{f.path || f.filename || String(f)}</code>{typeof f === 'object' && <span>+{f.additions || 0} / −{f.deletions || 0}</span>}</li>)}</ul></div>}<JsonDetails title="Raw commit JSON" data={item}/></div></details>
 }
 
-function ReviewView() {
-  const [number, setNumber] = useState(1), [review, setReview] = useState(null), [error, setError] = useState(null), [loading, setLoading] = useState(false), [approval, setApproval] = useState(null), [approvalError, setApprovalError] = useState(null), [selected, setSelected] = useState([])
-  async function load() { setLoading(true); setError(null); setApproval(null); try { const value = await api.prReview(Number(number)); setReview(value); setSelected(extractMessages(value.communication_bundle).filter(recommended).map((m, i) => messageId(m, i))) } catch (e) { setReview(null); setError(e) } finally { setLoading(false) } }
-  async function approve(approved, ids) { setApprovalError(null); try { setApproval(await api.approve(Number(number), approved, ids)) } catch (e) { setApprovalError(e) } }
+function ReviewView({ initialNumber, onApproved }) {
+  const [number, setNumber] = useState(() => initialNumber || 1), [review, setReview] = useState(null), [error, setError] = useState(null), [loading, setLoading] = useState(false), [approval, setApproval] = useState(null), [approvalError, setApprovalError] = useState(null), [selected, setSelected] = useState([]), [availablePrs, setAvailablePrs] = useState([])
+  async function load(targetNum) {
+    const num = targetNum !== undefined ? Number(targetNum) : Number(number)
+    if (!num || num < 1) return
+    setLoading(true); setError(null); setApproval(null)
+    try {
+      const value = await api.prReview(num)
+      setReview(value)
+      setSelected(extractMessages(value.communication_bundle).filter(recommended).map((m, i) => messageId(m, i)))
+    } catch (e) {
+      setReview(null); setError(e)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    api.listPrs().then(r => setAvailablePrs(r?.prs || [])).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    if (initialNumber && Number(initialNumber) > 0) {
+      setNumber(initialNumber)
+      load(initialNumber)
+    }
+  }, [initialNumber])
+
+  async function approve(approved, ids) {
+    setApprovalError(null)
+    try {
+      const res = await api.approve(Number(number), approved, ids)
+      setApproval(res)
+      if (approved && onApproved) {
+        onApproved(Number(number))
+      }
+    } catch (e) {
+      setApprovalError(e)
+    }
+  }
+
   function clear() { setReview(null); setError(null); setApproval(null); setApprovalError(null); setSelected([]) }
-  return <><PageHeader eyebrow="Human checkpoint" title="PR Review" description="Inspect impact and coordination evidence, then explicitly decide which stored Slack messages may be delivered."><div className="header-actions"><label className="compact-field">PR number<input type="number" min="1" value={number} onChange={e => setNumber(e.target.value)}/></label><button className="button primary" onClick={load} disabled={loading || number < 1}>{loading ? <Spinner label="Fetching…"/> : <><GitPullRequest aria-hidden="true"/>Fetch review</>}</button><button className="button ghost" onClick={clear}>Clear</button></div></PageHeader><ErrorAlert error={error}/>
+  return <><PageHeader eyebrow="Human checkpoint" title="PR Review" description="Inspect impact and coordination evidence, then explicitly decide which stored Slack messages may be delivered."><div className="header-actions"><label className="compact-field">PR number<input type="number" min="1" value={number} onChange={e => setNumber(e.target.value)}/></label><button className="button primary" onClick={() => load()} disabled={loading || number < 1}>{loading ? <Spinner label="Fetching…"/> : <><GitPullRequest aria-hidden="true"/>Fetch review</>}</button><button className="button ghost" onClick={clear}>Clear</button></div></PageHeader>
+    {availablePrs.length > 0 && <div className="pr-quick-chips"><span className="muted" style={{ fontSize: '0.75rem' }}>Recent PRs:</span>{availablePrs.slice(0, 6).map(p => <button key={p.pr_number} type="button" className={classNames('pr-chip', Number(number) === p.pr_number && 'active')} onClick={() => { setNumber(p.pr_number); load(p.pr_number) }}>#{p.pr_number} {p.approved ? '✓ Sent' : p.delivery_status === 'rejected' ? '✗ Rejected' : 'Ready'}</button>)}</div>}
+    <ErrorAlert error={error}/>
     {!review && !loading && <Empty icon={ShieldCheck} title="No review loaded">Enter a pull request number to inspect impact, coordination tasks, and draft communications.</Empty>}
     {review && <ReviewResult review={review} selected={selected} setSelected={setSelected} approve={approve} approval={approval} approvalError={approvalError}/>}</>
 }
@@ -119,12 +158,92 @@ function MappingView() {
     {!loaded ? <Empty icon={Users} title="Load the existing project context">Mappings update the current project only; they never create a second project.</Empty> : <div className="result-stack"><Card><span className="section-kicker">1 · Destination</span><div className="field"><label htmlFor="channel">Default Slack channel ID</label><span className="field-hint">All approved per-person messages are posted here.</span><input id="channel" value={channel} onChange={e => setChannel(e.target.value.toUpperCase())} placeholder="C012345"/></div></Card><Card><span className="section-kicker">2 · People</span><h2>Stakeholder mappings</h2><p className="muted">Unmapped rows remain in the project context but will not receive a mention.</p><div className="mapping-list">{people.map((p, i) => <div className="mapping-row" key={`${p.name}-${p.team}-${i}`}><span className="avatar">{(p.name || '?').slice(0,1).toUpperCase()}</span><div><strong>{p.name || '—'}</strong><small>{p.role || 'No role'} · {p.team || 'No team'}</small></div><input aria-label={`Slack user ID for ${p.name}`} value={p.slack_user_id || ''} onChange={e => update(i, e.target.value.toUpperCase())} placeholder="U012345"/></div>)}</div></Card><Card><span className="section-kicker">3 · Add person</span><form className="add-grid" onSubmit={addPerson}>{['name','team','role','slack_user_id'].map(k => <label key={k}>{k === 'slack_user_id' ? 'Slack user ID' : k[0].toUpperCase()+k.slice(1)}<input value={add[k]} onChange={e => setAdd({...add,[k]: k === 'slack_user_id' ? e.target.value.toUpperCase() : e.target.value})} placeholder={k === 'slack_user_id' ? 'U012345' : ''}/></label>)}<button className="button secondary"><Plus aria-hidden="true"/>Add to list</button></form></Card><div className="sticky-save"><span><strong>{people.filter(p => p.slack_user_id).length}</strong> mapped people</span><button className="button primary" onClick={save} disabled={loading}><Save aria-hidden="true"/>Save mappings</button></div></div>}</>
 }
 
+function PRNotificationBar({ notification, onReview }) {
+  if (!notification) return null
+  return (
+    <aside className="pr-notification-bar" role="status" aria-live="polite">
+      <div className="pr-notification-content" onClick={() => onReview(notification.pr_number)}>
+        <span className="pr-notification-icon"><BellRing aria-hidden="true"/></span>
+        <div className="pr-notification-text">
+          <span className="pr-notification-title">
+            Review and send the PR #{notification.pr_number} that was made
+          </span>
+          <span className="pr-notification-desc">
+            Autonomous coordination ready · Click to inspect impact, tasks, and deliver Slack notifications
+          </span>
+        </div>
+      </div>
+      <div className="pr-notification-actions">
+        <button type="button" className="button primary" onClick={() => onReview(notification.pr_number)}>
+          <GitPullRequest aria-hidden="true"/>Review & Send PR #{notification.pr_number}
+        </button>
+      </div>
+    </aside>
+  )
+}
+
 export default function App() {
   const [page, setPage] = useState(() => location.hash.slice(1) || 'context'), [menu, setMenu] = useState(false), [health, setHealth] = useState({ state:'checking' })
+  const [notification, setNotification] = useState(null)
+  const [completedPrs, setCompletedPrs] = useState(() => new Set())
+  const [reviewPr, setReviewPr] = useState(null)
+
   useEffect(() => { const controller = new AbortController(); api.health(controller.signal).then(body => setHealth({state:'online', body})).catch(error => { if (error.name !== 'AbortError') setHealth({state:'offline', error}) }); return () => controller.abort() }, [])
   useEffect(() => { location.hash = page; setMenu(false); window.scrollTo({top:0, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'}) }, [page])
+
+  // Async listener that monitors for the save of the latest PR review
+  useEffect(() => {
+    if (!projectId) return
+    let active = true
+
+    async function pollLatestPr() {
+      try {
+        const data = await api.latestPr()
+        if (!active) return
+        if (data?.has_pr && data.requires_action && data.pr_number) {
+          setCompletedPrs(completed => {
+            if (!completed.has(data.pr_number)) {
+              setNotification(prev => {
+                if (prev?.pr_number === data.pr_number && prev?.persisted_at === data.persisted_at) return prev
+                return {
+                  pr_number: data.pr_number,
+                  head_sha: data.head_sha,
+                  persisted_at: data.persisted_at,
+                  message_count: data.message_count,
+                }
+              })
+            } else {
+              setNotification(null)
+            }
+            return completed
+          })
+        } else {
+          setNotification(null)
+        }
+      } catch (err) {
+        // Silently catch polling errors
+      }
+    }
+
+    pollLatestPr()
+    const interval = setInterval(pollLatestPr, 4000)
+    return () => {
+      active = false
+      clearInterval(interval)
+    }
+  }, [projectId])
+
+  function handleReviewClick(prNum) {
+    setReviewPr(prNum)
+    setPage('review')
+  }
+
+  function handlePrApproved(prNum) {
+    setCompletedPrs(prev => new Set(prev).add(prNum))
+    setNotification(prev => (prev?.pr_number === prNum ? null : prev))
+  }
+
   const current = useMemo(() => pages.find(p => p[0] === page) || pages[0], [page])
   const CurrentIcon = current[2]
-  const View = page === 'journey' ? JourneyView : page === 'review' ? ReviewView : page === 'mapping' ? MappingView : ContextView
-  return <div className="app-shell"><a className="skip-link" href="#main">Skip to content</a><aside className={classNames('sidebar', menu && 'open')}><div className="brand"><span><Network aria-hidden="true"/></span><div><strong>Change Coordinator</strong><small>Impact-aware workspace</small></div><button className="icon-button mobile-only" onClick={() => setMenu(false)} aria-label="Close navigation"><X/></button></div><nav aria-label="Primary navigation">{pages.map(([id,label,Icon]) => <button key={id} className={page === id ? 'active' : ''} onClick={() => setPage(id)} aria-current={page === id ? 'page' : undefined}><Icon aria-hidden="true"/><span>{label}</span>{page === id && <ArrowRight aria-hidden="true"/>}</button>)}</nav><div className="sidebar-bottom"><div className="project-card"><span>Active project</span><code>{projectId || 'Not configured'}</code></div><div className={`health health-${health.state}`}><span className="health-dot"/><div><strong>{health.state === 'checking' ? 'Checking backend' : health.state === 'online' ? 'Backend connected' : 'Backend unreachable'}</strong><small>{health.state === 'online' ? (health.body?.status || 'Healthy') : health.state === 'offline' ? 'Review service configuration' : 'One moment…'}</small></div></div><p>Thin client · backend owns all business logic</p></div></aside><div className="main-column"><header className="topbar"><button className="icon-button mobile-only" onClick={() => setMenu(true)} aria-label="Open navigation"><Menu/></button><div><CurrentIcon aria-hidden="true"/><span>{current[1]}</span></div><div className="topbar-project"><span>Project</span><code>{projectId || 'Missing PROJECT_ID'}</code></div></header><main id="main"><View/></main></div>{menu && <button className="scrim" onClick={() => setMenu(false)} aria-label="Close navigation overlay"/>}</div>
+  return <div className="app-shell"><a className="skip-link" href="#main">Skip to content</a><aside className={classNames('sidebar', menu && 'open')}><div className="brand"><span><Network aria-hidden="true"/></span><div><strong>Change Coordinator</strong><small>Impact-aware workspace</small></div><button className="icon-button mobile-only" onClick={() => setMenu(false)} aria-label="Close navigation"><X/></button></div><nav aria-label="Primary navigation">{pages.map(([id,label,Icon]) => <button key={id} className={page === id ? 'active' : ''} onClick={() => setPage(id)} aria-current={page === id ? 'page' : undefined}><Icon aria-hidden="true"/><span>{label}</span>{page === id && <ArrowRight aria-hidden="true"/>}</button>)}</nav><div className="sidebar-bottom"><div className="project-card"><span>Active project</span><code>{projectId || 'Not configured'}</code></div><div className={`health health-${health.state}`}><span className="health-dot"/><div><strong>{health.state === 'checking' ? 'Checking backend' : health.state === 'online' ? 'Backend connected' : 'Backend unreachable'}</strong><small>{health.state === 'online' ? (health.body?.status || 'Healthy') : health.state === 'offline' ? 'Review service configuration' : 'One moment…'}</small></div></div><p>Thin client · backend owns all business logic</p></div></aside><div className="main-column"><header className="topbar"><button className="icon-button mobile-only" onClick={() => setMenu(true)} aria-label="Open navigation"><Menu/></button><div><CurrentIcon aria-hidden="true"/><span>{current[1]}</span></div><div className="topbar-project"><span>Project</span><code>{projectId || 'Missing PROJECT_ID'}</code></div></header><main id="main">{notification && <PRNotificationBar notification={notification} onReview={handleReviewClick}/>}{page === 'journey' ? <JourneyView/> : page === 'review' ? <ReviewView initialNumber={reviewPr} onApproved={handlePrApproved}/> : page === 'mapping' ? <MappingView/> : <ContextView/>}</main></div>{menu && <button className="scrim" onClick={() => setMenu(false)} aria-label="Close navigation overlay"/>}</div>
 }

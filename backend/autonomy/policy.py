@@ -13,7 +13,7 @@ import logging
 from typing import Any
 
 from . import config as aconfig
-from .models import AutonomyDecision
+from .models import AutonomyDecision, AutonomyDecisionResult
 
 logger = logging.getLogger("autonomy.policy")
 
@@ -45,6 +45,8 @@ def evaluate(
     requires_approval: bool = False,
     canonical_status: str = "needs_review",
     consistency_issues: list[str] | None = None,
+    decision_result: AutonomyDecisionResult | None = None,
+    shadow_mode: bool = False,
 ) -> AutonomyDecision:
     """Evaluate one resolved SlackMessage. Never raises (fails to HUMAN_REVIEW)."""
     impact = impact or {}
@@ -62,6 +64,8 @@ def evaluate(
             requires_approval=requires_approval,
             canonical_status=canonical_status,
             consistency_issues=consistency_issues or [],
+            decision_result=decision_result,
+            shadow_mode=shadow_mode,
         )
     except Exception as exc:  # never block the pipeline on policy bugs
         logger.exception("Autonomy policy failed for %s", mid)
@@ -70,29 +74,41 @@ def evaluate(
             reasons=[f"policy error, defaulting to review: {exc}"[:300]],
             supervisor_recommendation=supervisor_recommendation,
             dry_run=dry_run,
+            decision_model_result=decision_result,
+            shadow_mode=shadow_mode,
         )
 
 
 def _evaluate(message, *, impact, task, supervisor_recommendation,
               supervisor_reasons, already_delivered, auto_sent_this_pr,
               dry_run, reasons, requires_approval, canonical_status,
-              consistency_issues) -> AutonomyDecision:
+              consistency_issues, decision_result=None, shadow_mode=False) -> AutonomyDecision:
     mid = str(message.get("id", "") or "")
-    sup_rec = supervisor_recommendation if supervisor_recommendation in _ORDER else "HUMAN_REVIEW"
+    # When Decision-1.1 is active, its structured decision is the primary recommendation.
+    # When in shadow mode or Decision-1.1 is disabled, fallback to supervisor's recommendation.
+    if decision_result is not None and not shadow_mode:
+        effective_advisory = decision_result.recommended_decision
+    else:
+        effective_advisory = supervisor_recommendation
+
+    sup_rec = effective_advisory if effective_advisory in _ORDER else "HUMAN_REVIEW"
 
     def decide(decision: str, risk: str, extra: list[str]) -> AutonomyDecision:
         final = _more_restrictive(decision, sup_rec)
         all_reasons = list(extra)
         if final != decision:
-            all_reasons.append(f"supervisor recommended {sup_rec} (more restrictive)")
+            all_reasons.append(f"advisory recommended {sup_rec} (more restrictive)")
         if supervisor_reasons and final != "AUTO_SEND":
             all_reasons.extend([f"supervisor: {r}"[:300] for r in supervisor_reasons[:3]])
+        if decision_result is not None and decision_result.reason_code:
+            all_reasons.append(f"decision_model:{decision_result.reason_code}")
         return AutonomyDecision(
             message_id=mid, decision=final,  # type: ignore[arg-type]
             reasons=all_reasons[:8], risk_level=risk,
             confidence=float(impact.get("confidence", 0.0) or 0.0),
             evidence_count=int(len(message.get("evidence", []) or []) + len(impact.get("evidence", []) or [])),
-            supervisor_recommendation=sup_rec, dry_run=dry_run,
+            supervisor_recommendation=supervisor_recommendation, dry_run=dry_run,
+            decision_model_result=decision_result, shadow_mode=shadow_mode,
         )
 
     # --- BLOCK: invalid data / unmapped / prohibited (never sendable) ---
@@ -116,7 +132,18 @@ def _evaluate(message, *, impact, task, supervisor_recommendation,
     if impact_type in ("", "none"):
         return decide("SKIP", "low", ["no notifiable impact for recipient"])
 
-    # --- risk signals (security-sensitive => HUMAN_REVIEW regardless) ---
+    # Decision model specific guards
+    if decision_result is not None and not shadow_mode:
+        if decision_result.recommended_decision == "BLOCK":
+            return decide("BLOCK", "high", [f"decision model flagged invalid communication: {decision_result.reason_code}"])
+        if decision_result.creates_unapproved_commitment is True:
+            return decide("HUMAN_REVIEW", "high", ["message creates an unapproved commitment or obligation — human review required"])
+        if decision_result.communication_consequence_score is not None and decision_result.communication_consequence_score >= 1.5:
+            return decide("HUMAN_REVIEW", "high", [f"communication consequence score {decision_result.communication_consequence_score:.2f} — human review required"])
+        if decision_result.message_intent in ("new_commitment", "organizational_decision"):
+            return decide("HUMAN_REVIEW", "high", [f"message intent '{decision_result.message_intent}' requires human review"])
+
+    # --- risk signals (security-sensitive vs communication risk) ---
     risks = impact.get("risks", []) or []
     risk_text = " ".join(str(r) for r in risks)
     hit = _security_hit(
@@ -125,8 +152,20 @@ def _evaluate(message, *, impact, task, supervisor_recommendation,
         str(task.get("component", "") or ""),
         str(message.get("text", "") or "")[:1000],
     )
-    if hit:
+
+    # When Decision-1.1 specifically evaluates the message consequence as low and recommends AUTO_SEND,
+    # safe grounded awareness notifications about security modules are allowed.
+    decision_allows_safe_security = (
+        decision_result is not None
+        and not shadow_mode
+        and decision_result.recommended_decision == "AUTO_SEND"
+        and (decision_result.communication_consequence_score or 0.0) < 1.0
+        and not decision_result.creates_unapproved_commitment
+    )
+
+    if hit and not decision_allows_safe_security:
         return decide("HUMAN_REVIEW", "high", [f"security-sensitive keyword {hit!r} — human approval required"])
+
     if impact_type == "approval":
         return decide("HUMAN_REVIEW", "high", ["approval impact — human sign-off required regardless of confidence"])
     if requires_approval:
@@ -150,7 +189,7 @@ def _evaluate(message, *, impact, task, supervisor_recommendation,
     if evidence_count < aconfig.min_evidence():
         return decide("HUMAN_REVIEW", "medium",
                       [f"evidence items {evidence_count} below minimum {aconfig.min_evidence()}"])
-    if impact_type == "action" and not aconfig.allow_action():
+    if impact_type == "action" and not aconfig.allow_action() and not (decision_result and decision_result.recommended_decision == "AUTO_SEND" and not shadow_mode):
         return decide("HUMAN_REVIEW", "medium", ["action impact requires human approval (AUTONOMY_ALLOW_ACTION off)"])
     if auto_sent_this_pr >= aconfig.max_auto_per_pr():
         return decide("HUMAN_REVIEW", "medium",
