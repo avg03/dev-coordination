@@ -1,7 +1,10 @@
-# Dev-Coordination
+# Dev-Coordination -> A Github - Slack Agentic automation
 
 > **Impact-Aware Engineering Memory & Autonomous Stakeholder Coordination**  
 > Continuous change intelligence, static blast-radius analysis, and supervised multi-agent coordination for modern software engineering teams.
+
+> [!NOTE]  
+> **Current Scope:** Dev-Coordination is an independently designed prototype currently operating as a **single-user, single-repository workspace**, maintaining engineering context and coordinating changes across one GitHub project.
 
 **Architecture & Capabilities**  
 [![Agentic AI](https://img.shields.io/badge/Agentic%20AI-Autonomous%20Reasoning-8A2BE2)](#8-multi-agent-architecture)
@@ -43,7 +46,7 @@ Equipped with a dual-layer AI decision architecture—combining **Google ADK** m
 ---
 ## 🖥️ Product Workflow
 
-Change Coordinator turns engineering activity into persistent context, impact analysis, stakeholder coordination, and targeted communication.
+Dev-Coordination turns engineering activity into persistent context, impact analysis, stakeholder coordination, and targeted communication.
 
 ### 1. Build Project Context
 
@@ -51,7 +54,7 @@ Define the project's architecture, objectives, components, ownership, and team s
 This context becomes the foundation for subsequent change and impact analysis.
 
 <p align="center">
-  <img src="assets\Project_context.png" width="900" alt="Change Coordinator - Project Context">
+  <img src="assets\Project_context.png" width="900" alt="Dev-Coordination - Project Context">
 </p>
 
 ---
@@ -61,17 +64,17 @@ This context becomes the foundation for subsequent change and impact analysis.
 Connect project roles and stakeholders with their Slack identities so communication can be routed deterministically to the right people.
 
 <p align="center">
-  <img src="assets\Slack_map.png" width="900" alt="Change Coordinator - Slack Mapping">
+  <img src="assets\Slack_map.png" width="900" alt="Dev-Coordination - Slack Mapping">
 </p>
 
 ---
 
 ### 3. Pull Request Detected
 
-When a new pull request is created, Change Coordinator detects it and starts the PR analysis and coordination workflow.
+When a new pull request is created, Dev-Coordination detects it and starts the PR analysis and coordination workflow.
 
 <p align="center">
-  <img src="assets\PR_notification.png" width="900" alt="Change Coordinator - Pull Request Detection">
+  <img src="assets\PR_notification.png" width="900" alt="Dev-Coordination - Pull Request Detection">
 </p>
 
 ---
@@ -81,7 +84,7 @@ When a new pull request is created, Change Coordinator detects it and starts the
 The system combines enriched commit context with PR information to identify affected components, stakeholders, and the overall impact of the change.
 
 <p align="center">
-  <img src="assets\Pr_review1.png" width="900" alt="Change Coordinator - PR Impact Analysis">
+  <img src="assets\Pr_review1.png" width="900" alt="Dev-Coordination - PR Impact Analysis">
 </p>
 
 ---
@@ -91,7 +94,7 @@ The system combines enriched commit context with PR information to identify affe
 Deterministic repository analysis provides evidence for direct and indirect dependencies, component ownership, and potentially affected teams.
 
 <p align="center">
-  <img src="assets\Blast radius.png" width="900" alt="Change Coordinator - Blast Radius Analysis">
+  <img src="assets\Blast radius.png" width="900" alt="Dev-Coordination - Blast Radius Analysis">
 </p>
 
 ---
@@ -101,7 +104,7 @@ Deterministic repository analysis provides evidence for direct and indirect depe
 The agent pipeline converts the impact analysis into structured coordination tasks — identifying who needs awareness, action, or involvement.
 
 <p align="center">
-  <img src="assets\Coordinationplan.png" width="900" alt="Change Coordinator - Coordination Plan">
+  <img src="assets\Coordinationplan.png" width="900" alt="Dev-Coordination - Coordination Plan">
 </p>
 
 ---
@@ -112,7 +115,7 @@ Context-aware messages are generated for affected stakeholders.
 The supervision and autonomy layer determines whether communication can be sent automatically or requires human review.
 
 <p align="center">
-  <img src="assets\Communication.png" width="900" alt="Change Coordinator - Communication Review">
+  <img src="assets\Communication.png" width="900" alt="Dev-Coordination - Communication Review">
 </p>
 
 ---
@@ -122,7 +125,7 @@ The supervision and autonomy layer determines whether communication can be sent 
 Approved communication is delivered to the relevant stakeholders with the change, reason for notification, required action, supporting evidence, and confidence.
 
 <p align="center">
-  <img src="assets\Slack.png" width="900" alt="Change Coordinator - Slack Notification">
+  <img src="assets\Slack.png" width="900" alt="Dev-Coordination - Slack Notification">
 </p>
 
 ---
@@ -132,7 +135,7 @@ Approved communication is delivered to the relevant stakeholders with the change
 Processed commits become part of a persistent engineering memory, creating a traceable history of how the project evolves over time.
 
 <p align="center">
-  <img src="assets\work_journey.png" width="900" alt="Change Coordinator - Work Journey">
+  <img src="assets\work_journey.png" width="900" alt="Dev-Coordination - Work Journey">
 </p>
 
 The system provides an integrated React SPA delivering four core operator workflows:
@@ -802,7 +805,11 @@ dev-coordination/
 
 ## 16. Current Limitations & Roadmap
 
+> [!NOTE]
+> **Current Scope:** Dev-Coordination is an independently designed prototype currently operating as a **single-user, single-repository workspace**, maintaining engineering context and coordinating changes across one GitHub project.
+
 ### Current Limitations
+- **Current Scope:** Dev-Coordination is an independently designed prototype currently operating as a **single-user, single-repository workspace**, maintaining engineering context and coordinating changes across one GitHub project.
 - **Language Support for ASTs:** The sandboxed blast-radius analyzer currently parses Python import graphs and symbols natively. TypeScript/Go/Java analysis relies on component path matching.
 - **Approver Authentication:** The `/api/projects/{id}/prs/{n}/approve` endpoint validates approval consistency and records an audit log, but does not yet enforce OAuth/SSO identity tokens.
 - **Git History in Sandboxes:** The sandbox provisions a lightweight tarball snapshot at the PR head SHA without full commit history, limiting contributor-frequency heuristics.
