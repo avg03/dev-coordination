@@ -168,42 +168,8 @@ Modern software development operates at high velocity, but team coordination rem
 
 Dev-Coordination bridges the gap between raw Git events and proactive team coordination:
 
-```mermaid
-flowchart LR
-    GH[GitHub Push / PR] -->|Webhook| ING[FastAPI Gateway]
-    ING -->|Publish| PS[Cloud Pub/Sub]
-    PS -->|Push Events| CW[Commit Worker]
-    PS -->|PR Events| PW[PR Worker]
-    
-    subgraph Memory Pipeline
-        CW -->|Analyze| CR[ChangeRecord]
-        CR -->|Enrich| CAA[ChangeAnalysis Agent]
-        CAA -->|Save| EC[(Enriched Changes)]
-    end
-    
-    subgraph Coordination Pipeline
-        PW -->|Check Commits| RG{All Commits Enriched?}
-        RG -->|No| WAIT[Waiting PR Store]
-        RG -->|Yes| CANON[Canonical Context]
-        WAIT -.->|Resume via Completion Consumer| CANON
-        
-        CANON --> BRA[Blast Radius AST Sandbox]
-        BRA --> IAA[Impact Analysis Agent]
-        IAA --> COA[Coordination Agent]
-        COA --> CMA[Communication Agent]
-        CMA --> SVA[Supervisor Agent]
-    end
-    
-    subgraph Decision & Governance
-        SVA --> MD[Microsoft Decision-1.1]
-        MD --> POL{Autonomy Policy}
-        POL -->|AUTO_SEND| PG[Permission Gateway]
-        POL -->|HUMAN_REVIEW| UI[React Review Dashboard]
-        UI -->|Manual Approval| PG
-        PG -->|Atomic Lease| IDEM[Idempotency Manager]
-        IDEM -->|Post Message| SLK[Slack API Executor]
-    end
-```
+<img width="1448" height="1086" alt="Dev-Coordination Architecture with Added Connectors" src="https://github.com/user-attachments/assets/87a23d65-dfc8-45e4-a6fc-54e2779b835d" />
+
 
 1. **Continuous Memory Building:** Commits are ingested in real-time, categorized deterministically, enriched with behavioral context, and indexed against project tasks.
 2. **Deterministic Blast Radius:** Before running LLMs, static analysis inspects imports and symbol references to locate all downstream consumers.
