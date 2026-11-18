@@ -3,16 +3,28 @@
 > **Impact-Aware Engineering Memory & Autonomous Stakeholder Coordination**  
 > Continuous change intelligence, static blast-radius analysis, and supervised multi-agent coordination for modern software engineering teams.
 
+**Architecture & Capabilities**  
+[![Agentic AI](https://img.shields.io/badge/Agentic%20AI-Autonomous%20Reasoning-8A2BE2)](#8-multi-agent-architecture)
+[![Multi-Agent System](https://img.shields.io/badge/System-Multi--Agent%20Coordination-4B0082)](#8-multi-agent-architecture)
+[![Event-Driven Architecture](https://img.shields.io/badge/Architecture-Event--Driven-FF6F00)](#7-event-driven-workflows)
+[![Policy-Based Autonomy](https://img.shields.io/badge/Autonomy-Policy--Based%20Governance-008080)](#9-autonomy--human-in-the-loop-oversight)
+[![Idempotency](https://img.shields.io/badge/Reliability-Atomic%20Idempotency-2E8B57)](#10-engineering-reliability--security)
+
+**Core Technologies & Integrations**  
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Google ADK](https://img.shields.io/badge/Google%20ADK-2.5.0-4285F4?logo=google&logoColor=white)](https://github.com/google/adk)
 [![Microsoft Decision-1.1](https://img.shields.io/badge/Microsoft-Decision--1.1-0078D4?logo=microsoftazure&logoColor=white)](https://azure.microsoft.com/)
-[![Google Cloud Pub/Sub](https://img.shields.io/badge/Cloud%20Pub%2FSub-Event--Driven-4285F4?logo=googlecloud&logoColor=white)](https://cloud.google.com/pubsub)
+[![Google Cloud Pub/Sub](https://img.shields.io/badge/Cloud%20Pub%2FSub-Event--Streaming-4285F4?logo=googlecloud&logoColor=white)](https://cloud.google.com/pubsub)
 [![Google Cloud Firestore](https://img.shields.io/badge/Cloud%20Firestore-NoSQL-FFCA28?logo=firebase&logoColor=black)](https://cloud.google.com/firestore)
-[![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-Tracing-F54A00?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
-[![Langfuse](https://img.shields.io/badge/Langfuse-Observability-000000?logo=langfuse&logoColor=white)](https://langfuse.com/)
+[![Slack API](https://img.shields.io/badge/Slack-SDK%20%26%20Block%20Kit-4A154B?logo=slack&logoColor=white)](https://api.slack.com/)
 [![React 18](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev/)
 [![Docker Compose](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/compose/)
+
+**Observability & Governance**  
+[![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-Tracing-F54A00?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
+[![Langfuse](https://img.shields.io/badge/Langfuse-LLM%20Tracing-000000?logo=langfuse&logoColor=white)](https://langfuse.com/)
+[![Audit Logging](https://img.shields.io/badge/Governance-Tamper--Proof%20Audit-1E3A8A)](#10-engineering-reliability--security)
 
 ---
 
