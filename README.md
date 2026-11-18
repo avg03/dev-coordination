@@ -41,19 +41,99 @@ Equipped with a dual-layer AI decision architecture—combining **Google ADK** m
 - **Zero-Trust Security & Exactly-Once Delivery:** Enforces a deny-by-default capability matrix across all agent tool calls, protected by atomic distributed idempotency leases and tamper-proof audit trails.
 
 ---
+## 🖥️ Product Workflow
 
-## 2. Product Walkthrough
+Change Coordinator turns engineering activity into persistent context, impact analysis, stakeholder coordination, and targeted communication.
 
-<!-- Replace with your actual demo video embed or GIF preview -->
-```
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                                                                                        │
-│                                [ PRODUCT DEMO VIDEO ]                                  │
-│             Watch Dev-Coordination analyze a GitHub PR, compute blast radius,        │
-│                evaluate autonomy with Decision-1.1, and dispatch to Slack              │
-│                                                                                        │
-└────────────────────────────────────────────────────────────────────────────────────────┘
-```
+### 1. Build Project Context
+
+Define the project's architecture, objectives, components, ownership, and team structure.  
+This context becomes the foundation for subsequent change and impact analysis.
+
+<p align="center">
+  <img src="assets\Project_context.png" width="900" alt="Change Coordinator - Project Context">
+</p>
+
+---
+
+### 2. Map Engineering Stakeholders
+
+Connect project roles and stakeholders with their Slack identities so communication can be routed deterministically to the right people.
+
+<p align="center">
+  <img src="assets\Slack_map.png" width="900" alt="Change Coordinator - Slack Mapping">
+</p>
+
+---
+
+### 3. Pull Request Detected
+
+When a new pull request is created, Change Coordinator detects it and starts the PR analysis and coordination workflow.
+
+<p align="center">
+  <img src="assets\PR_notification.png" width="900" alt="Change Coordinator - Pull Request Detection">
+</p>
+
+---
+
+### 4. Analyze PR Impact
+
+The system combines enriched commit context with PR information to identify affected components, stakeholders, and the overall impact of the change.
+
+<p align="center">
+  <img src="assets\Pr_review1.png" width="900" alt="Change Coordinator - PR Impact Analysis">
+</p>
+
+---
+
+### 5. Determine the Blast Radius
+
+Deterministic repository analysis provides evidence for direct and indirect dependencies, component ownership, and potentially affected teams.
+
+<p align="center">
+  <img src="assets\Blast radius.png" width="900" alt="Change Coordinator - Blast Radius Analysis">
+</p>
+
+---
+
+### 6. Generate a Coordination Plan
+
+The agent pipeline converts the impact analysis into structured coordination tasks — identifying who needs awareness, action, or involvement.
+
+<p align="center">
+  <img src="assets\Coordinationplan.png" width="900" alt="Change Coordinator - Coordination Plan">
+</p>
+
+---
+
+### 7. Generate & Review Communication
+
+Context-aware messages are generated for affected stakeholders.  
+The supervision and autonomy layer determines whether communication can be sent automatically or requires human review.
+
+<p align="center">
+  <img src="assets\Communication.png" width="900" alt="Change Coordinator - Communication Review">
+</p>
+
+---
+
+### 8. Deliver Targeted Slack Notifications
+
+Approved communication is delivered to the relevant stakeholders with the change, reason for notification, required action, supporting evidence, and confidence.
+
+<p align="center">
+  <img src="assets\Slack.png" width="900" alt="Change Coordinator - Slack Notification">
+</p>
+
+---
+
+### 9. Maintain the Engineering Work Journey
+
+Processed commits become part of a persistent engineering memory, creating a traceable history of how the project evolves over time.
+
+<p align="center">
+  <img src="assets\work_journey.png" width="900" alt="Change Coordinator - Work Journey">
+</p>
 
 The system provides an integrated React SPA delivering four core operator workflows:
 
